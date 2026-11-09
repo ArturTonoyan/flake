@@ -67,7 +67,7 @@ final class StatusBarController {
         menu.addItem(clear)
 
         let tip = NSMenuItem(
-            title: "3 шара друг на друга → снеговик",
+            title: "3 шара → снеговик; ПКМ → табличка",
             action: nil,
             keyEquivalent: ""
         )
@@ -75,7 +75,7 @@ final class StatusBarController {
         menu.addItem(tip)
 
         let lanTip = NSMenuItem(
-            title: "Кинь снежок за край экрана → другу по Wi‑Fi",
+            title: "Кинь снежок/снеговика за край → другу",
             action: nil,
             keyEquivalent: ""
         )
@@ -191,15 +191,32 @@ final class StatusBarController {
             )
             hint.isEnabled = false
             sub.addItem(hint)
-
-            let preview = NSMenuItem(
-                title: "Тест прилёта на этот Mac",
-                action: #selector(previewLanHit),
-                keyEquivalent: ""
-            )
-            preview.target = self
-            sub.addItem(preview)
         }
+
+        sub.addItem(.separator())
+        let preview = NSMenuItem(
+            title: "Тест обычного прилёта",
+            action: #selector(previewLanHit),
+            keyEquivalent: ""
+        )
+        preview.target = self
+        sub.addItem(preview)
+
+        let previewGiant = NSMenuItem(
+            title: "Тест огромного (весь экран)",
+            action: #selector(previewGiantLanHit),
+            keyEquivalent: "t"
+        )
+        previewGiant.target = self
+        sub.addItem(previewGiant)
+
+        let previewSnowman = NSMenuItem(
+            title: "Тест снеговика с табличкой",
+            action: #selector(previewSnowmanHit),
+            keyEquivalent: ""
+        )
+        previewSnowman.target = self
+        sub.addItem(previewSnowman)
 
         root.submenu = sub
         return root
@@ -231,7 +248,15 @@ final class StatusBarController {
     }
 
     @objc private func previewLanHit() {
-        overlay.previewLanSnowballHit()
+        overlay.previewLanSnowballHit(giant: false)
+    }
+
+    @objc private func previewGiantLanHit() {
+        overlay.previewLanSnowballHit(giant: true)
+    }
+
+    @objc private func previewSnowmanHit() {
+        overlay.previewLanSnowmanHit()
     }
 
     @objc private func setPeerSide(_ sender: NSMenuItem) {

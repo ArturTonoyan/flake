@@ -16,6 +16,7 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let flakePipeline: MTLRenderPipelineState
     private let ballPipeline: MTLRenderPipelineState
+    private let softBallPipeline: MTLRenderPipelineState
     private let driftPipeline: MTLRenderPipelineState
 
     // Dedicated buffers — never reuse the same storage for two encoded draws
@@ -24,6 +25,11 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
     private var ballBuffer: MTLBuffer?
     private var decorBuffer: MTLBuffer?
     private var lanBuffer: MTLBuffer?
+    private var lanFlakeBuffer: MTLBuffer?
+    private var softBallPosBuffer: MTLBuffer?
+    private var softBallLocalBuffer: MTLBuffer?
+    private var lanSoftBallPosBuffer: MTLBuffer?
+    private var lanSoftBallLocalBuffer: MTLBuffer?
     private var driftPosBuffer: MTLBuffer?
     private var driftColBuffer: MTLBuffer?
     private var propPosBuffer: MTLBuffer?
@@ -64,6 +70,8 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
             let flakeF = library.makeFunction(name: "flake_fragment"),
             let ballV = library.makeFunction(name: "ball_vertex"),
             let ballF = library.makeFunction(name: "ball_fragment"),
+            let softBallV = library.makeFunction(name: "softball_vertex"),
+            let softBallF = library.makeFunction(name: "softball_fragment"),
             let driftV = library.makeFunction(name: "drift_vertex"),
             let driftF = library.makeFunction(name: "drift_fragment")
         else { return nil }
@@ -79,6 +87,23 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         ballDesc.fragmentFunction = ballF
         ballDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
         Self.enableBlending(ballDesc.colorAttachments[0])
+
+        let softBallDesc = MTLRenderPipelineDescriptor()
+        softBallDesc.vertexFunction = softBallV
+        softBallDesc.fragmentFunction = softBallF
+        softBallDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+        Self.enableBlending(softBallDesc.colorAttachments[0])
+
+        let softBallVertex = MTLVertexDescriptor()
+        softBallVertex.attributes[0].format = .float2
+        softBallVertex.attributes[0].offset = 0
+        softBallVertex.attributes[0].bufferIndex = 0
+        softBallVertex.layouts[0].stride = MemoryLayout<SIMD2<Float>>.stride
+        softBallVertex.attributes[1].format = .float4
+        softBallVertex.attributes[1].offset = 0
+        softBallVertex.attributes[1].bufferIndex = 2
+        softBallVertex.layouts[2].stride = MemoryLayout<SIMD4<Float>>.stride
+        softBallDesc.vertexDescriptor = softBallVertex
 
         let driftDesc = MTLRenderPipelineDescriptor()
         driftDesc.vertexFunction = driftV
@@ -100,6 +125,7 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         do {
             flakePipeline = try device.makeRenderPipelineState(descriptor: flakeDesc)
             ballPipeline = try device.makeRenderPipelineState(descriptor: ballDesc)
+            softBallPipeline = try device.makeRenderPipelineState(descriptor: softBallDesc)
             driftPipeline = try device.makeRenderPipelineState(descriptor: driftDesc)
         } catch {
             return nil
@@ -151,10 +177,11 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         )
         memcpy(uniformsBuffer.contents(), &frame, MemoryLayout<FrameUniforms>.stride)
 
-        let minX = Float(screenFrame.minX) - 40
-        let maxX = Float(screenFrame.maxX) + 40
-        let minY = Float(screenFrame.minY) - 40
-        let maxY = Float(screenFrame.maxY) + 40
+        // Wide pad so giant LAN snowballs / large rolled balls near edges still upload.
+        let minX = Float(screenFrame.minX) - 220
+        let maxX = Float(screenFrame.maxX) + 220
+        let minY = Float(screenFrame.minY) - 220
+        let maxY = Float(screenFrame.maxY) + 220
 
         if !lanOnly {
             // Drifts only — dedicated buffers, never shared with props.
@@ -194,6 +221,14 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
                 encoder: enc,
                 minX: minX, maxX: maxX, minY: minY, maxY: maxY
             )
+            drawSoftBallMesh(
+                positions: simulator.softBallPositions,
+                localOp: simulator.softBallLocalOp,
+                posBuffer: &softBallPosBuffer,
+                localBuffer: &softBallLocalBuffer,
+                encoder: enc,
+                minX: minX, maxX: maxX, minY: minY, maxY: maxY
+            )
 
             // Carrot / twigs / bucket — dedicated buffers (never share with drifts).
             if !simulator.propVertices.isEmpty {
@@ -227,6 +262,14 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         }
 
         // Peer hits / stains — always on top of window content & fullscreen apps.
+        drawSoftBallMesh(
+            positions: simulator.lanSoftBallPositions,
+            localOp: simulator.lanSoftBallLocalOp,
+            posBuffer: &lanSoftBallPosBuffer,
+            localBuffer: &lanSoftBallLocalBuffer,
+            encoder: enc,
+            minX: minX, maxX: maxX, minY: minY, maxY: maxY
+        )
         drawPointBatch(
             simulator.lanOverlayUpload,
             pipeline: ballPipeline,
@@ -234,10 +277,47 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
             encoder: enc,
             minX: minX, maxX: maxX, minY: minY, maxY: maxY
         )
+        // Shatter crystals — same snowflake look as falling snow.
+        drawPointBatch(
+            simulator.lanFlakeUpload,
+            pipeline: flakePipeline,
+            buffer: &lanFlakeBuffer,
+            encoder: enc,
+            minX: minX, maxX: maxX, minY: minY, maxY: maxY
+        )
 
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
+    }
+
+    private func drawSoftBallMesh(
+        positions: [SIMD2<Float>],
+        localOp: [SIMD4<Float>],
+        posBuffer: inout MTLBuffer?,
+        localBuffer: inout MTLBuffer?,
+        encoder: MTLRenderCommandEncoder,
+        minX: Float,
+        maxX: Float,
+        minY: Float,
+        maxY: Float
+    ) {
+        guard !positions.isEmpty, positions.count == localOp.count else { return }
+        let onScreen = positions.contains {
+            $0.x >= minX && $0.x <= maxX && $0.y >= minY && $0.y <= maxY
+        }
+        guard onScreen else { return }
+        uploadMesh(
+            positions: positions,
+            colors: localOp,
+            posBuffer: &posBuffer,
+            colBuffer: &localBuffer
+        )
+        encoder.setRenderPipelineState(softBallPipeline)
+        encoder.setVertexBuffer(posBuffer, offset: 0, index: 0)
+        encoder.setVertexBuffer(localBuffer, offset: 0, index: 2)
+        encoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: positions.count)
     }
 
     private func uploadMesh(

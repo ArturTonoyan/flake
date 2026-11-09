@@ -9,6 +9,7 @@ final class OverlayController {
         let view: MTKView
         let renderer: SnowRenderer
         let screenID: CGDirectDisplayID
+        let signHUD: SnowmanSignHUD
     }
 
     private var overlays: [ScreenOverlay] = []
@@ -28,6 +29,7 @@ final class OverlayController {
     private(set) var lanPeers: [PeerInfo] = []
     var onLanPeersChanged: (() -> Void)?
     private let toast = LanToastBanner()
+    private let snowmanPoster = InboundSnowmanPoster()
 
     var isPaused = false
 
@@ -104,11 +106,23 @@ final class OverlayController {
             )
             self.toast.show("Снежок от \(short)")
         }
+        peerNetwork.onInboundSnowman = { [weak self] man in
+            guard let self else { return }
+            let short = Self.shortPeerName(man.fromName)
+            self.snowmanPoster.present(from: man, peerShortName: short) { [weak self] center in
+                self?.simulator.shatterPosterSnowman(atX: Float(center.x), y: Float(center.y))
+            }
+            self.toast.show("Снеговик от \(short)")
+        }
         peerNetwork.onThrowDelivered = { [weak self] name in
             self?.toast.show("Долетело → \(Self.shortPeerName(name))")
         }
         peerNetwork.onThrowMissed = { [weak self] name in
-            self?.toast.show("Не дошло до \(Self.shortPeerName(name))")
+            if name.hasPrefix("никого") || name.contains("Wi‑Fi") {
+                self?.toast.show("Не дошло: \(name)")
+            } else {
+                self?.toast.show("Не дошло до \(Self.shortPeerName(name))")
+            }
         }
         let saved = UserDefaults.standard.bool(forKey: PeerSnowNetwork.defaultsKeyEnabled)
         simulator.lanHandoffEnabled = saved
@@ -120,18 +134,40 @@ final class OverlayController {
     }
 
     /// Local preview of the peer hit animation (fly → explode → stain).
-    func previewLanSnowballHit() {
+    func previewLanSnowballHit(giant: Bool = false) {
         lanSnowballsEnabled = true
         let edge: SnowEdge = Bool.random() ? .left : .right
+        let mass: Float = giant
+            ? SnowSimulator.ballMaxMass
+            : Float.random(in: 40...120)
         _ = simulator.spawnInboundSnowball(
             entryEdge: edge,
             normY: Float.random(in: 0.2...0.8),
             vx: edge == .left ? 400 : -400,
             vy: Float.random(in: -80...80),
-            mass: Float.random(in: 40...120),
-            fromName: "тест"
+            mass: mass,
+            fromName: giant ? "гигант" : "тест"
         )
-        toast.show("Снежок от тест")
+        toast.show(giant ? "Огромный снежок (тест)" : "Снежок от тест")
+    }
+
+    /// Local preview of a signed snowman flying in (stays until click).
+    func previewLanSnowmanHit() {
+        lanSnowballsEnabled = true
+        let edge: SnowEdge = Bool.random() ? .left : .right
+        let man = InboundSnowman(
+            fromPeerID: 0,
+            fromName: "тест",
+            entryEdge: edge,
+            normY: Float.random(in: 0.3...0.7),
+            vx: edge == .left ? 400 : -400,
+            vy: Float.random(in: -40...40),
+            signText: "Привет!"
+        )
+        snowmanPoster.present(from: man, peerShortName: "тест") { [weak self] center in
+            self?.simulator.shatterPosterSnowman(atX: Float(center.x), y: Float(center.y))
+        }
+        toast.show("Снеговик от тест")
     }
 
     static func shortPeerName(_ name: String) -> String {
@@ -147,7 +183,9 @@ final class OverlayController {
 
     private func installMouseMonitors() {
         removeMouseMonitors()
-        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .leftMouseDragged]
+        let mask: NSEvent.EventTypeMask = [
+            .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown
+        ]
         let handler: (NSEvent) -> Void = { [weak self] event in
             guard let self else { return }
             switch event.type {
@@ -155,6 +193,8 @@ final class OverlayController {
                 self.simulator.mouseDown = true
             case .leftMouseUp:
                 self.simulator.mouseDown = false
+            case .rightMouseDown:
+                self.handleSnowmanSignClick(at: event)
             default:
                 break
             }
@@ -170,6 +210,46 @@ final class OverlayController {
         }
     }
 
+    private func handleSnowmanSignClick(at event: NSEvent) {
+        _ = event
+        let screenPoint = NSEvent.mouseLocation
+        guard let idx = simulator.snowmanIndexAt(x: Float(screenPoint.x), y: Float(screenPoint.y)) else {
+            return
+        }
+        promptSnowmanSign(at: idx)
+    }
+
+    private func promptSnowmanSign(at index: Int) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Табличка снеговика"
+        alert.informativeText = "Напиши текст на табличку. Потом кинь снеговика за край экрана — друг увидит надпись."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.stringValue = simulator.signText(at: index) ?? ""
+        field.placeholderString = "Например: Привет!"
+        field.maximumNumberOfLines = 1
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Готово")
+        alert.addButton(withTitle: "Убрать табличку")
+        alert.addButton(withTitle: "Отмена")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let response = alert.runModal()
+            switch response {
+            case .alertFirstButtonReturn:
+                self.simulator.setSnowmanSign(at: index, text: field.stringValue)
+                if !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.toast.show("Табличка готова — кинь за край")
+                }
+            case .alertSecondButtonReturn:
+                self.simulator.setSnowmanSign(at: index, text: "")
+            default:
+                break
+            }
+        }
+    }
+
     private func removeMouseMonitors() {
         for monitor in mouseMonitors {
             NSEvent.removeMonitor(monitor)
@@ -180,10 +260,15 @@ final class OverlayController {
 
     func clearSnow() {
         simulator.clear()
+        snowmanPoster.dismissAll()
+        for item in overlays {
+            item.signHUD.clear()
+        }
     }
 
     private func tearDownOverlays() {
         for item in overlays {
+            item.signHUD.clear()
             item.panel.orderOut(nil)
             item.view.delegate = nil
         }
@@ -253,7 +338,17 @@ final class OverlayController {
             }
 
             view.delegate = renderer
-            overlays.append(ScreenOverlay(panel: panel, view: view, renderer: renderer, screenID: screenID))
+            let signHUD = SnowmanSignHUD()
+            signHUD.attach(to: view)
+            overlays.append(
+                ScreenOverlay(
+                    panel: panel,
+                    view: view,
+                    renderer: renderer,
+                    screenID: screenID,
+                    signHUD: signHUD
+                )
+            )
             panel.orderFrontRegardless()
         }
         NSLog("Flake: active overlays=\(overlays.count)")
@@ -347,14 +442,19 @@ final class OverlayController {
                 for exit in simulator.consumeEdgeExits() {
                     peerNetwork.sendSnowball(exit)
                 }
+                for exit in simulator.consumeSnowmanExits() {
+                    peerNetwork.sendSnowman(exit)
+                }
             }
         } else {
             // Peer hits still animate while local snow is paused.
             simulator.tickLanImpacts(dt: dt)
         }
 
+        let signEntries = simulator.snowmenSignHUD()
         let hasLanHits = simulator.hasActiveLanImpacts
         for item in overlays {
+            item.signHUD.sync(entries: signEntries, panel: item.panel)
             // Maximized / fullscreen → hide regular snow, but keep the panel up for peer hits
             // so the splat reads on top of (and "inside") any window / fullscreen app.
             let blocked = simulator.isSnowBlocked(screenFrame: item.renderer.screenFrame)

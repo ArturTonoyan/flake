@@ -45,6 +45,24 @@ struct InboundSnowball {
     let mass: Float
 }
 
+struct OutboundSnowman {
+    let edge: SnowEdge
+    let normY: Float
+    let vx: Float
+    let vy: Float
+    let signText: String
+}
+
+struct InboundSnowman {
+    let fromPeerID: UInt64
+    let fromName: String
+    let entryEdge: SnowEdge
+    let normY: Float
+    let vx: Float
+    let vy: Float
+    let signText: String
+}
+
 /// LAN-only Bonjour + UDP snowball exchange.
 ///
 /// Discovery and packets stay on Wi‑Fi / Ethernet / AWDL (interface-scoped),
@@ -66,15 +84,20 @@ final class PeerSnowNetwork {
     private static let magic: UInt32 = 0x464C4B45 // FLKE
     private static let version: UInt8 = 1
     private static let packetSize = 48
+    /// Snowman + sign: header(40) + text(64) + hmac(8).
+    private static let snowmanPacketSize = 112
+    private static let signTextBytes = 64
+    static let maxSignCharacters = 40
     private static let typeHeartbeat: UInt8 = 1
     private static let typeSnowball: UInt8 = 2
     private static let typeGoodbye: UInt8 = 3
     private static let typeAck: UInt8 = 4
+    private static let typeSnowman: UInt8 = 5
     private static let maxSnowballsPerSecond = 12
     private static let deliveryTimeout: CFTimeInterval = 1.8
     private static let maxAbsVelocity: Float = 2_400
     private static let minMass: Float = 8
-    private static let maxMass: Float = 180
+    private static let maxMass: Float = 4_000
 
     private let localID: UInt64
     private let localToken: Data
@@ -98,6 +121,7 @@ final class PeerSnowNetwork {
 
     var onPeersChanged: (([PeerInfo]) -> Void)?
     var onInboundSnowball: ((InboundSnowball) -> Void)?
+    var onInboundSnowman: ((InboundSnowman) -> Void)?
     /// Peer confirmed the snowball landed on their screen.
     var onThrowDelivered: ((String) -> Void)?
     /// No ACK within timeout — likely blocked / offline mid-flight.
@@ -206,9 +230,21 @@ final class PeerSnowNetwork {
     /// Throw a snowball that left the local desktop toward the peer on that edge.
     func sendSnowball(_ ball: OutboundSnowball) {
         queue.async { [weak self] in
-            guard let self, self.enabled else { return }
+            guard let self else { return }
+            guard self.enabled else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("Wi‑Fi выкл")
+                }
+                return
+            }
             let targets = self.targets(for: ball.edge)
-            guard let peer = targets.first else { return }
+            guard let peer = targets.first else {
+                let side = ball.edge == .left ? "влево" : "вправо"
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("никого \(side)")
+                }
+                return
+            }
             let seq = self.send(
                 type: Self.typeSnowball,
                 to: peer,
@@ -216,7 +252,7 @@ final class PeerSnowNetwork {
                 normY: ball.normY,
                 vx: ball.vx,
                 vy: ball.vy,
-                mass: ball.mass
+                mass: min(Self.maxMass, max(Self.minMass, ball.mass))
             )
             if let seq {
                 self.pendingThrows[seq] = PendingThrow(
@@ -224,6 +260,52 @@ final class PeerSnowNetwork {
                     peerName: peer.name,
                     sentAt: CACurrentMediaTime()
                 )
+            } else {
+                let name = peer.name
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?(name)
+                }
+            }
+        }
+    }
+
+    /// Throw a signed snowman that left the local desktop toward the peer on that edge.
+    func sendSnowman(_ man: OutboundSnowman) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.enabled else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("Wi‑Fi выкл")
+                }
+                return
+            }
+            let targets = self.targets(for: man.edge)
+            guard let peer = targets.first else {
+                let side = man.edge == .left ? "влево" : "вправо"
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("никого \(side)")
+                }
+                return
+            }
+            let seq = self.sendSnowmanPacket(
+                to: peer,
+                edge: man.edge,
+                normY: man.normY,
+                vx: man.vx,
+                vy: man.vy,
+                signText: man.signText
+            )
+            if let seq {
+                self.pendingThrows[seq] = PendingThrow(
+                    peerID: peer.id,
+                    peerName: peer.name,
+                    sentAt: CACurrentMediaTime()
+                )
+            } else {
+                let name = peer.name
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?(name)
+                }
             }
         }
     }
@@ -555,6 +637,58 @@ final class PeerSnowNetwork {
         return seq
     }
 
+    @discardableResult
+    private func sendSnowmanPacket(
+        to peer: PeerState,
+        edge: SnowEdge,
+        normY: Float,
+        vx: Float,
+        vy: Float,
+        signText: String,
+        seqOverride: UInt32? = nil
+    ) -> UInt32? {
+        guard let connection = peers[peer.id]?.connection ?? {
+            ensureConnection(for: peer.id)
+            return peers[peer.id]?.connection
+        }() else { return nil }
+
+        let seq = seqOverride ?? UInt32.random(in: 1...UInt32.max)
+        let clipped = String(signText.prefix(Self.maxSignCharacters))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var textData = Data(clipped.utf8.prefix(Self.signTextBytes - 1))
+        while textData.count < Self.signTextBytes { textData.append(0) }
+
+        // Layout (112): header40 + text64 + hmac8
+        var packet = Data(count: Self.snowmanPacketSize)
+        packet.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            writeUInt32(Self.magic, to: base)
+            base[4] = Self.version
+            base[5] = Self.typeSnowman
+            writeUInt16(0, to: base + 6)
+            writeUInt64(localID, to: base + 8)
+            writeUInt32(seq, to: base + 16)
+            writeUInt32(UInt32(CACurrentMediaTime()), to: base + 20)
+            base[24] = edge.rawValue
+            base[25] = 0
+            let normFixed = UInt16(min(1, max(0, normY)) * 10_000)
+            writeUInt16(normFixed, to: base + 26)
+            writeFloat(vx, to: base + 28)
+            writeFloat(vy, to: base + 32)
+            writeFloat(0, to: base + 36)
+        }
+        packet.replaceSubrange(40..<104, with: textData)
+
+        let key = sharedKey(localToken: localToken, peerToken: peer.token)
+        let body = packet.prefix(104)
+        let mac = HMAC<SHA256>.authenticationCode(for: body, using: key)
+        let tag = Data(mac).prefix(8)
+        packet.replaceSubrange(104..<112, with: tag)
+
+        connection.send(content: packet, completion: .contentProcessed { _ in })
+        return seq
+    }
+
     private func receiveLoop(on connection: NWConnection, expectedPeerID: UInt64?) {
         connection.receiveMessage { [weak self] content, _, _, error in
             self?.queue.async {
@@ -563,14 +697,17 @@ final class PeerSnowNetwork {
                         self?.receiveLoop(on: connection, expectedPeerID: expectedPeerID)
                     }
                 }
-                guard let self, self.enabled, let content, content.count == Self.packetSize else { return }
+                guard let self, self.enabled, let content else { return }
+                let n = content.count
+                guard n == Self.packetSize || n == Self.snowmanPacketSize else { return }
                 self.handlePacket(content, on: connection, expectedPeerID: expectedPeerID)
             }
         }
     }
 
     private func handlePacket(_ data: Data, on connection: NWConnection, expectedPeerID: UInt64?) {
-        guard data.count == Self.packetSize else { return }
+        let isSnowmanPacket = data.count == Self.snowmanPacketSize
+        guard data.count == Self.packetSize || isSnowmanPacket else { return }
         let bytes = [UInt8](data)
         let magic = readUInt32(bytes, 0)
         guard magic == Self.magic, bytes[4] == Self.version else { return }
@@ -584,7 +721,8 @@ final class PeerSnowNetwork {
             return
         }
 
-        let body = data.prefix(40)
+        let bodyLen = isSnowmanPacket ? 104 : 40
+        let body = data.prefix(bodyLen)
         let tag = data.suffix(8)
         let key = sharedKey(localToken: localToken, peerToken: peer.token)
         let expected = Data(HMAC<SHA256>.authenticationCode(for: body, using: key)).prefix(8)
@@ -617,6 +755,7 @@ final class PeerSnowNetwork {
         case Self.typeHeartbeat:
             emitPeersChanged()
         case Self.typeSnowball:
+            guard data.count == Self.packetSize else { return }
             guard allowInbound(from: senderID) else { return }
             let edgeRaw = bytes[24]
             guard let leaveEdge = SnowEdge(rawValue: edgeRaw) else { return }
@@ -652,6 +791,46 @@ final class PeerSnowNetwork {
             )
             DispatchQueue.main.async { [weak self] in
                 self?.onInboundSnowball?(inbound)
+            }
+        case Self.typeSnowman:
+            guard isSnowmanPacket else { return }
+            guard allowInbound(from: senderID) else { return }
+            let edgeRaw = bytes[24]
+            guard let leaveEdge = SnowEdge(rawValue: edgeRaw) else { return }
+            let normFixed = readUInt16(bytes, 26)
+            let normY = min(1, max(0, Float(normFixed) / 10_000))
+            var vx = readFloat(bytes, 28)
+            var vy = readFloat(bytes, 32)
+            vx = min(Self.maxAbsVelocity, max(-Self.maxAbsVelocity, vx))
+            vy = min(Self.maxAbsVelocity, max(-Self.maxAbsVelocity, vy))
+            let rawText = Data(bytes[40..<104])
+            let end = rawText.firstIndex(of: 0) ?? rawText.endIndex
+            let sign = String(data: rawText[..<end], encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let safeSign = String(sign.prefix(Self.maxSignCharacters))
+            guard !safeSign.isEmpty else { return }
+            let entry: SnowEdge = (leaveEdge == .left) ? .right : .left
+            let inbound = InboundSnowman(
+                fromPeerID: senderID,
+                fromName: peer.name,
+                entryEdge: entry,
+                normY: normY,
+                vx: vx,
+                vy: vy,
+                signText: safeSign
+            )
+            _ = send(
+                type: Self.typeAck,
+                to: peer,
+                edge: leaveEdge,
+                normY: 0,
+                vx: 0,
+                vy: 0,
+                mass: 0,
+                seqOverride: seq
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.onInboundSnowman?(inbound)
             }
         case Self.typeGoodbye:
             peers[senderID]?.connection?.cancel()

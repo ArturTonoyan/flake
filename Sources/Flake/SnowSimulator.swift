@@ -28,8 +28,18 @@ struct Snowball {
     var restingLedge: UInt32?
 
     var radius: Float {
-        // Slow packing: long roll reaches ~26pt, not a giant instantly.
-        max(6, min(36, 4.2 + sqrtf(max(mass, 1)) * 1.65))
+        // Normal small ball at first; only a long roll adds giant size.
+        // ~mass 20→12, 80→18, 180→26, 800→70, 2000→160, 4000→320
+        let m = max(mass, 1)
+        let small = min(28, 5.0 + sqrtf(m) * 1.55)
+        let giant: Float
+        if m > 220 {
+            let t = min(1, (m - 220) / (SnowSimulator.ballMaxMass - 220))
+            giant = powf(t, 0.9) * (SnowSimulator.ballVisualMaxRadius - 28)
+        } else {
+            giant = 0
+        }
+        return max(6, min(SnowSimulator.ballVisualMaxRadius, small + giant))
     }
 }
 
@@ -49,6 +59,9 @@ private struct LanImpact {
         var size: Float
         var life: Float
         var maxLife: Float
+        /// Crystal snowflake (flake shader) vs soft snow grit (ball shader).
+        var asFlake: Bool
+        var phase: Float
     }
 
     var phase: Phase
@@ -59,12 +72,19 @@ private struct LanImpact {
     var bvx: Float
     var bvy: Float
     var radius: Float
+    var mass: Float
     var age: Float
     var stainAge: Float
     var stainLifetime: Float
     var burst: [BurstBit]
     var blotches: [(dx: Float, dy: Float, scale: Float)]
     var fromName: String
+
+    /// 0…1 how screen-filling this hit is (small toss vs giant boulder).
+    var coverage: Float {
+        let span = max(1, SnowSimulator.ballMaxMass - 60)
+        return min(1, max(0, (mass - 60) / span))
+    }
 }
 
 /// Three stacked balls fused into a snowman.
@@ -78,6 +98,8 @@ struct Snowman {
     var headMass: Float
     var held: Bool
     var restingLedge: UInt32?
+    /// Optional sign text (right-click to edit). Thrown over LAN with the snowman.
+    var signText: String = ""
 
     // Neat classic stack: base > mid > head.
     var baseR: Float { max(13, min(26, 6.5 + sqrtf(baseMass) * 1.35)) }
@@ -88,6 +110,14 @@ struct Snowman {
     var midY: Float { y + (baseR + midR) * 0.68 }
     var headY: Float { midY + (midR + headR) * 0.68 }
     var topY: Float { headY + headR }
+
+    /// Right-hand tip — where the sign board sits.
+    var signAnchor: SIMD2<Float> {
+        let ox = x + midR * 0.82
+        let oy = midY + midR * 0.18
+        let len = midR * 1.35
+        return SIMD2(ox + len * 0.95, oy + len * 0.55)
+    }
 }
 
 struct SettledSurface {
@@ -364,26 +394,41 @@ final class SnowSimulator {
     /// Snow gathered while dragging before a ball actually appears.
     private var formingMass: Float = 0
     private let ballSpawnThreshold: Float = 11
-    private let ballMaxMass: Float = 180
+    /// Shared with LAN clamp / radius formulas — long roll can fill a peer's screen.
+    static let ballMaxMass: Float = 4_000
+    /// ~half of a laptop screen height; huge local balls are tiled in draw.
+    static let ballVisualMaxRadius: Float = 420
+    private var ballMaxMass: Float { Self.ballMaxMass }
     /// Recent cursor velocity while holding — release-frame speed is often ~0 after a flick.
     private var flickVX: Float = 0
     private var flickVY: Float = 0
-    private var flickAge: Float = 0
+    /// How long the cursor has been nearly still while holding — clears flick memory.
+    private var flickStillAge: Float = 0
     /// Ball indices that must leave a ledge before soft re-settle (just thrown).
     private var throwIgnoreSettle: Set<Int> = []
 
     private(set) var flakeUpload: [SIMD4<Float>] = []
     private(set) var ballUpload: [SIMD4<Float>] = []
     private(set) var decorUpload: [SIMD4<Float>] = []
+    /// Large realistic snowballs (triangle fans with soft lit fragment shader).
+    private(set) var softBallPositions: [SIMD2<Float>] = []
+    private(set) var softBallLocalOp: [SIMD4<Float>] = []
 
     /// Snowballs that left the left/right desktop edge this frame (LAN handoff).
     private(set) var pendingEdgeExits: [OutboundSnowball] = []
+    /// Signed snowmen that left a screen edge this frame.
+    private(set) var pendingSnowmanExits: [OutboundSnowman] = []
     /// When false, edge exits melt locally instead of being offered to peers.
     var lanHandoffEnabled = false
     /// Peer snowball impacts: fly → explode → stain. Drawn even over fullscreen apps.
     private var lanImpacts: [LanImpact] = []
     /// Always-on-top sprites for LAN impacts (ball + stain blotches + burst grit).
     private(set) var lanOverlayUpload: [SIMD4<Float>] = []
+    /// Shatter crystals drawn with the snowflake shader.
+    private(set) var lanFlakeUpload: [SIMD4<Float>] = []
+    /// Large inbound snowballs use the same soft-ball mesh as local giants.
+    private(set) var lanSoftBallPositions: [SIMD2<Float>] = []
+    private(set) var lanSoftBallLocalOp: [SIMD4<Float>] = []
     private(set) var driftVertices: [SIMD2<Float>] = []
     private(set) var driftColors: [SIMD4<Float>] = []
     private(set) var driftStripCounts: [Int] = []
@@ -511,13 +556,19 @@ final class SnowSimulator {
     }
 
     func hasLanImpacts(in screenFrame: NSRect) -> Bool {
-        let minX = Float(screenFrame.minX) - 40
-        let maxX = Float(screenFrame.maxX) + 40
-        let minY = Float(screenFrame.minY) - 40
-        let maxY = Float(screenFrame.maxY) + 40
+        let minX = Float(screenFrame.minX)
+        let maxX = Float(screenFrame.maxX)
+        let minY = Float(screenFrame.minY)
+        let maxY = Float(screenFrame.maxY)
         return lanImpacts.contains { hit in
-            (hit.bx >= minX && hit.bx <= maxX && hit.by >= minY && hit.by <= maxY)
-                || (hit.x >= minX && hit.x <= maxX && hit.y >= minY && hit.y <= maxY)
+            let pad = hit.radius + 40
+            let inFlight =
+                hit.bx + pad >= minX && hit.bx - pad <= maxX
+                && hit.by + pad >= minY && hit.by - pad <= maxY
+            let atTarget =
+                hit.x + pad >= minX && hit.x - pad <= maxX
+                && hit.y + pad >= minY && hit.y - pad <= maxY
+            return inFlight || atTarget
         }
     }
 
@@ -563,6 +614,83 @@ final class SnowSimulator {
         return exits
     }
 
+    func consumeSnowmanExits() -> [OutboundSnowman] {
+        let exits = pendingSnowmanExits
+        pendingSnowmanExits.removeAll(keepingCapacity: true)
+        return exits
+    }
+
+    /// Right-click target for editing a sign.
+    func snowmanIndexAt(x: Float, y: Float) -> Int? {
+        nearestSnowman(atX: x, y: y, maxDist: 44)
+    }
+
+    func setSnowmanSign(at index: Int, text: String) {
+        guard snowmen.indices.contains(index) else { return }
+        let trimmed = String(text.prefix(PeerSnowNetwork.maxSignCharacters))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        snowmen[index].signText = trimmed
+    }
+
+    func signText(at index: Int) -> String? {
+        guard snowmen.indices.contains(index) else { return nil }
+        let t = snowmen[index].signText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// HUD labels: global Cocoa points + text for snowmen holding a sign.
+    func snowmenSignHUD() -> [(x: Float, y: Float, text: String)] {
+        snowmen.compactMap { s in
+            let t = s.signText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { return nil }
+            if isParkedOnOtherSpace(restingLedge: s.restingLedge) { return nil }
+            if isOnBlockedScreen(x: s.x, y: s.y) { return nil }
+            let a = s.signAnchor
+            return (a.x, a.y + 10, t)
+        }
+    }
+
+    /// Shatter a poster snowman (LAN inbound) into grit + flakes at a screen point.
+    func shatterPosterSnowman(atX x: Float, y: Float) {
+        guard lanImpacts.count < 16 else {
+            emitSandCascade(x: x, fromY: y + 50, toY: y - 40, count: 48, outward: 28)
+            return
+        }
+        let radius: Float = 48
+        let mass: Float = 160
+        var blotches: [(dx: Float, dy: Float, scale: Float)] = [(0, 0, 1)]
+        for _ in 0..<Int.random(in: 5...8, using: &rng) {
+            blotches.append(
+                (
+                    dx: Float.random(in: -1.0...1.0, using: &rng) * radius,
+                    dy: Float.random(in: -1.2...0.6, using: &rng) * radius,
+                    scale: Float.random(in: 0.28...0.7, using: &rng)
+                )
+            )
+        }
+        lanImpacts.append(
+            LanImpact(
+                phase: .exploding,
+                x: x,
+                y: y,
+                bx: x,
+                by: y,
+                bvx: 0,
+                bvy: 0,
+                radius: radius,
+                mass: mass,
+                age: 0,
+                stainAge: 0,
+                stainLifetime: Float.random(in: 1.4...2.0, using: &rng),
+                burst: makeLanBurst(atX: x, y: y, radius: radius, big: false),
+                blotches: blotches,
+                fromName: ""
+            )
+        )
+        // Extra falling clumps so it reads as a snowman collapsing, not just a ball hit.
+        emitSandCascade(x: x, fromY: y + 55, toY: y - 35, count: 36, outward: 22)
+    }
+
     /// Peer snowball: flies in from the entry edge to a random spot, explodes, leaves a stain.
     @discardableResult
     func spawnInboundSnowball(
@@ -575,7 +703,6 @@ final class SnowSimulator {
     ) -> Bool {
         guard lanImpacts.count < 12 else { return false }
         let clampedMass = min(ballMaxMass, max(8, mass))
-        let radius = max(10, min(34, 5.5 + sqrtf(clampedMass) * 1.55))
 
         // Prefer a random point on a random display (inset so the stain reads clearly).
         let screen: (minX: Float, maxX: Float, minY: Float, maxY: Float, width: Float)
@@ -584,8 +711,16 @@ final class SnowSimulator {
         } else {
             screen = (worldMinX, worldMaxX, worldMinY, worldMaxY, max(1, worldMaxX - worldMinX))
         }
-        let insetX: Float = 90
-        let insetY: Float = 80
+        let screenH = max(1, screen.maxY - screen.minY)
+        let screenW = max(1, screen.width)
+        let coverage = min(1, max(0, (clampedMass - 60) / max(1, ballMaxMass - 60)))
+        // Same look as a normal snowball — just bigger. Cap ~half-screen diameter.
+        let smallR = max(10, min(36, 5.5 + sqrtf(min(clampedMass, 180)) * 1.55))
+        let halfScreenR = min(screenW, screenH) * 0.25
+        let radius = smallR + (halfScreenR - smallR) * powf(coverage, 0.85)
+
+        let insetX: Float = max(radius + 20, coverage > 0.45 ? 70 : 90)
+        let insetY: Float = max(radius + 20, coverage > 0.45 ? 60 : 80)
         let targetX = Float.random(
             in: (screen.minX + insetX)...max(screen.minX + insetX + 1, screen.maxX - insetX),
             using: &rng
@@ -607,17 +742,27 @@ final class SnowSimulator {
         let dx = targetX - startX
         let dy = targetY - startY
         let dist = max(1, hypot(dx, dy))
-        let speed = max(980, min(1_600, hypot(vx, vy) * 1.8 + 1_050))
+        // Big snowballs whip in fast; small ones keep the usual pace.
+        let speed: Float = coverage >= 0.45
+            ? max(1_800, min(2_800, hypot(vx, vy) * 2.2 + 1_900))
+            : max(980, min(1_600, hypot(vx, vy) * 1.8 + 1_050))
         var blotches: [(dx: Float, dy: Float, scale: Float)] = [(0, 0, 1)]
-        for _ in 0..<Int.random(in: 5...8, using: &rng) {
+        let blotchCount = coverage >= 0.45
+            ? Int.random(in: 6...10, using: &rng)
+            : Int.random(in: 5...8, using: &rng)
+        for _ in 0..<blotchCount {
             blotches.append(
                 (
-                    dx: Float.random(in: -1.1...1.1, using: &rng) * radius,
-                    dy: Float.random(in: -0.85...0.85, using: &rng) * radius,
-                    scale: Float.random(in: 0.35...0.85, using: &rng)
+                    dx: Float.random(in: -1.1...1.1, using: &rng) * radius * (coverage >= 0.45 ? 0.7 : 1),
+                    dy: Float.random(in: -0.85...0.85, using: &rng) * radius * (coverage >= 0.45 ? 0.7 : 1),
+                    scale: Float.random(in: 0.3...0.75, using: &rng)
                 )
             )
         }
+        // Big hit: short snowflake shower, not a lingering plastic blob.
+        let stainLife: Float = coverage >= 0.45
+            ? Float.random(in: 1.6...2.2, using: &rng)
+            : Float.random(in: 1.8...2.6, using: &rng)
         lanImpacts.append(
             LanImpact(
                 phase: .flying,
@@ -628,9 +773,10 @@ final class SnowSimulator {
                 bvx: dx / dist * speed,
                 bvy: dy / dist * speed,
                 radius: radius,
+                mass: clampedMass,
                 age: 0,
                 stainAge: 0,
-                stainLifetime: Float.random(in: 1.8...2.6, using: &rng),
+                stainLifetime: stainLife,
                 burst: [],
                 blotches: blotches,
                 fromName: fromName
@@ -647,15 +793,21 @@ final class SnowSimulator {
         balls.removeAll(keepingCapacity: true)
         snowmen.removeAll(keepingCapacity: true)
         pendingEdgeExits.removeAll(keepingCapacity: true)
+        pendingSnowmanExits.removeAll(keepingCapacity: true)
         lanImpacts.removeAll(keepingCapacity: true)
         lanOverlayUpload.removeAll(keepingCapacity: true)
+        lanFlakeUpload.removeAll(keepingCapacity: true)
+        softBallPositions.removeAll(keepingCapacity: true)
+        softBallLocalOp.removeAll(keepingCapacity: true)
+        lanSoftBallPositions.removeAll(keepingCapacity: true)
+        lanSoftBallLocalOp.removeAll(keepingCapacity: true)
         heldBallIndex = nil
         rollingBallIndex = nil
         heldSnowmanIndex = nil
         formingMass = 0
         flickVX = 0
         flickVY = 0
-        flickAge = 0
+        flickStillAge = 0
         throwIgnoreSettle.removeAll(keepingCapacity: true)
         surfaceMissingSince.removeAll(keepingCapacity: true)
         restoreGuardUntil.removeAll(keepingCapacity: true)
@@ -704,29 +856,37 @@ final class SnowSimulator {
         buildUploadBuffers()
     }
 
-    /// Keep the strongest recent swipe so a throw still launches after the cursor stops.
+    /// Remember a brief flick peak, but forget it once the cursor actually stops.
     private func sampleFlickVelocity(dt: Float) {
         let holding = mouseDown && (heldBallIndex != nil || rollingBallIndex != nil || heldSnowmanIndex != nil)
         guard holding else {
-            if !mouseDown {
-                flickAge += dt
-                if flickAge > 0.18 {
-                    flickVX = 0
-                    flickVY = 0
-                }
+            flickVX = 0
+            flickVY = 0
+            flickStillAge = 0
+            return
+        }
+        let speed = hypot(mouseVX, mouseVY)
+        if speed < 45 {
+            // Cursor stopped — quickly erase swipe memory so a calm release won't throw.
+            flickStillAge += dt
+            if flickStillAge > 0.1 {
+                flickVX = 0
+                flickVY = 0
+            } else {
+                flickVX *= 0.7
+                flickVY *= 0.7
             }
             return
         }
-        flickAge = 0
-        let speed = hypot(mouseVX, mouseVY)
+        flickStillAge = 0
         let flickSpeed = hypot(flickVX, flickVY)
-        // Fresh fast samples win; otherwise decay slowly so a flick peak survives release.
+        // Fresh fast samples win; light decay so a quick flick still counts on release.
         if speed >= flickSpeed * 0.85 || speed > 140 {
             flickVX = mouseVX
             flickVY = mouseVY
         } else {
-            flickVX *= 0.92
-            flickVY *= 0.92
+            flickVX *= 0.88
+            flickVY *= 0.88
         }
     }
 
@@ -1092,6 +1252,28 @@ final class SnowSimulator {
         // Mostly upward contact = resting on the top edge / drift, not a glass hit.
         let ny = dy / d
         return ny <= 0.55
+    }
+
+    /// Shatter rules: let slow drops seat on the ledge for snowmen; flying giants skim past.
+    private func shouldShatterBall(
+        against win: SnowWindow,
+        x: Float,
+        y: Float,
+        radius: Float,
+        speed: Float
+    ) -> Bool {
+        guard circleOverlapsWindowBody(win, x: x, y: y, radius: radius) else { return false }
+        let bodyTop = win.y - 1
+        // Near the top snow ledge — stacking / settling owns this, not a smash.
+        let nearTop = y >= bodyTop - max(14, radius * 0.45)
+        if nearTop, speed < 130 {
+            return false
+        }
+        // Fast throws only break if the center is clearly inside the glass pane.
+        if speed > 90 {
+            return x >= win.x && x <= win.right && y < bodyTop - 6 && y >= win.bottom
+        }
+        return true
     }
 
     /// Explode a thrown snowball against a window into falling snow grit.
@@ -1742,7 +1924,7 @@ final class SnowSimulator {
         if pressed {
             flickVX = 0
             flickVY = 0
-            flickAge = 0
+            flickStillAge = 0
             if let sIdx = nearestSnowman(atX: mouseX, y: mouseY, maxDist: 40) {
                 snowmen[sIdx].held = true
                 snowmen[sIdx].restingLedge = nil
@@ -1785,10 +1967,15 @@ final class SnowSimulator {
     }
 
     private func releaseGrabbedBall() {
-        // Prefer the recent flick peak — release-frame mouseVX/VY is often near zero.
+        let cursorSpeed = hypot(mouseVX, mouseVY)
+        // Cursor stopped (or was still briefly) → drop, don't throw from old swipe memory.
+        let calmed = flickStillAge > 0.08 || cursorSpeed < 40
         let releaseVX: Float
         let releaseVY: Float
-        if hypot(flickVX, flickVY) > hypot(mouseVX, mouseVY) {
+        if calmed {
+            releaseVX = mouseVX
+            releaseVY = mouseVY
+        } else if hypot(flickVX, flickVY) > cursorSpeed {
             releaseVX = flickVX
             releaseVY = flickVY
         } else {
@@ -1799,18 +1986,36 @@ final class SnowSimulator {
         if let sIdx = heldSnowmanIndex, snowmen.indices.contains(sIdx) {
             snowmen[sIdx].held = false
             snowmen[sIdx].restingLedge = nil
-            var tvx = releaseVX * 0.85
-            var tvy = releaseVY * 0.75
-            let speed = hypot(tvx, tvy)
-            if speed > 60, speed < 260 {
-                let boost = 260 / max(speed, 1)
-                tvx *= boost
-                tvy *= boost
-            }
-            snowmen[sIdx].vx = tvx
-            snowmen[sIdx].vy = tvy
-            if speed > 60 {
-                snowmen[sIdx].y += max(8, snowmen[sIdx].baseR * 0.4)
+            if calmed {
+                snowmen[sIdx].vx = 0
+                snowmen[sIdx].vy = 0
+                let ledges = occluders.compactMap { $0.canAccumulate ? $0.ledge : nil }
+                for ledge in ledges.sorted(by: { $0.y > $1.y }) {
+                    let pad = snowmen[sIdx].baseR
+                    guard snowmen[sIdx].x >= ledge.x - pad,
+                          snowmen[sIdx].x <= ledge.x + ledge.width + pad else { continue }
+                    let pile = surfaces[ledge.id]?.height(atLocalX: snowmen[sIdx].x - ledge.x) ?? 0
+                    let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: snowmen[sIdx].baseR)
+                    if abs(snowmen[sIdx].y - ground) <= snowmen[sIdx].baseR * 2.8 {
+                        snowmen[sIdx].y = ground
+                        snowmen[sIdx].restingLedge = ledge.id
+                        break
+                    }
+                }
+            } else {
+                var tvx = releaseVX * 0.85
+                var tvy = releaseVY * 0.75
+                let speed = hypot(tvx, tvy)
+                if speed > 60, speed < 260 {
+                    let boost = 260 / max(speed, 1)
+                    tvx *= boost
+                    tvy *= boost
+                }
+                snowmen[sIdx].vx = tvx
+                snowmen[sIdx].vy = tvy
+                if speed > 60 {
+                    snowmen[sIdx].y += max(8, snowmen[sIdx].baseR * 0.4)
+                }
             }
         }
         heldSnowmanIndex = nil
@@ -1820,34 +2025,40 @@ final class SnowSimulator {
             balls[idx].held = false
             balls[idx].stackedOn = nil
             balls[idx].restingLedge = nil
-            // Fling with flick velocity — allow upward / sideways throws.
-            var throwVX = releaseVX * 0.95
-            var throwVY = releaseVY * 0.9
-            let speed = hypot(throwVX, throwVY)
-            balls[idx].vx = throwVX
-            balls[idx].vy = throwVY
-            if speed > 55, speed < 280 {
-                // Boost weak flicks so a quick swipe always launches.
-                let boost = 280 / max(speed, 1)
-                throwVX *= boost
-                throwVY *= boost
-                balls[idx].vx = throwVX
-                balls[idx].vy = throwVY
-                // Lift off the pile so the same-frame land catch doesn't eat the throw.
-                balls[idx].y += max(6, balls[idx].radius * 0.35)
-                throwIgnoreSettle.insert(idx)
-            } else if speed <= 55 {
-                // Slow drop: try stacking / settling instead of a toss.
-                balls[idx].vx = throwVX
-                balls[idx].vy = min(0, throwVY)
+            if calmed {
+                balls[idx].vx = 0
+                balls[idx].vy = 0
                 let snowmenBefore = snowmen.count
                 tryStack(ballIndex: idx)
                 if snowmen.count == snowmenBefore, balls.indices.contains(idx), balls[idx].stackedOn == nil {
                     settleBallOnLedgeIfNeeded(idx)
                 }
             } else {
-                balls[idx].y += max(6, balls[idx].radius * 0.35)
-                throwIgnoreSettle.insert(idx)
+                var throwVX = releaseVX * 0.95
+                var throwVY = releaseVY * 0.9
+                let speed = hypot(throwVX, throwVY)
+                if speed > 90, speed < 280 {
+                    let boost = 280 / max(speed, 1)
+                    throwVX *= boost
+                    throwVY *= boost
+                    balls[idx].vx = throwVX
+                    balls[idx].vy = throwVY
+                    balls[idx].y += max(6, balls[idx].radius * 0.35)
+                    throwIgnoreSettle.insert(idx)
+                } else if speed <= 90 {
+                    balls[idx].vx = throwVX * 0.35
+                    balls[idx].vy = min(0, throwVY * 0.2)
+                    let snowmenBefore = snowmen.count
+                    tryStack(ballIndex: idx)
+                    if snowmen.count == snowmenBefore, balls.indices.contains(idx), balls[idx].stackedOn == nil {
+                        settleBallOnLedgeIfNeeded(idx)
+                    }
+                } else {
+                    balls[idx].vx = throwVX
+                    balls[idx].vy = throwVY
+                    balls[idx].y += max(6, balls[idx].radius * 0.35)
+                    throwIgnoreSettle.insert(idx)
+                }
             }
         }
         heldBallIndex = nil
@@ -1855,7 +2066,7 @@ final class SnowSimulator {
         formingMass = 0
         flickVX = 0
         flickVY = 0
-        flickAge = 0
+        flickStillAge = 0
     }
 
     /// Soft point sprites fade before the full radius — nest into the pile so the
@@ -2068,15 +2279,23 @@ final class SnowSimulator {
             guard win.canAccumulate, activeSurfaceIDs.contains(win.id) else { return nil }
             return win.ledge
         }
+        let r = balls[index].radius
         for ledge in ledges.sorted(by: { $0.y > $1.y }) {
-            guard balls[index].x >= ledge.x, balls[index].x <= ledge.x + ledge.width else { continue }
-            let pile = surfaces[ledge.id]?.height(atLocalX: balls[index].x - ledge.x) ?? 0
-            let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: balls[index].radius)
-            // Must be near the ledge — never teleport up/down onto a distant window.
-            guard abs(balls[index].y - ground) <= balls[index].radius * 2.5 else { continue }
+            let pad = max(8, r * 0.6)
+            guard balls[index].x >= ledge.x - pad, balls[index].x <= ledge.x + ledge.width + pad else {
+                continue
+            }
+            let local = max(0, min(ledge.width, balls[index].x - ledge.x))
+            let pile = surfaces[ledge.id]?.height(atLocalX: local) ?? 0
+            let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: r)
+            // Generous vertical band so a soft drop from a short height still seats.
+            guard balls[index].y >= ground - r * 1.2, balls[index].y <= ground + r * 3.2 else {
+                continue
+            }
+            balls[index].x = max(ledge.x + 3, min(ledge.x + ledge.width - 3, balls[index].x))
             balls[index].y = ground
             balls[index].vy = 0
-            balls[index].vx *= 0.5
+            balls[index].vx = 0
             balls[index].restingLedge = ledge.id
             return
         }
@@ -2227,7 +2446,8 @@ final class SnowSimulator {
             midMass: ordered[1].mass,
             headMass: ordered[2].mass,
             held: false,
-            restingLedge: nil
+            restingLedge: nil,
+            signText: ""
         )
         if let lid = balls[base].restingLedge,
            let surface = surfaces[lid],
@@ -2433,8 +2653,12 @@ final class SnowSimulator {
         guard balls.indices.contains(ballIndex) else { return }
         var gainedTotal: Float = 0
         let r = balls[ballIndex].radius
+        let mass = balls[ballIndex].mass
         let speed = hypot(mouseVX, mouseVY)
         let travel = min(18, speed * max(dt, 1.0 / 120.0))
+        // Early balls stay small; growth accelerates only after a real roll.
+        let earlySlow: Float = mass < 180 ? 0.35 : 1
+        let sizeSlow = earlySlow / (1 + r / 110)
 
         for (id, var surface) in surfaces {
             guard activeSurfaceIDs.contains(id) else { continue }
@@ -2442,16 +2666,16 @@ final class SnowSimulator {
             guard mouseX >= ledge.x - r - 8, mouseX <= ledge.x + ledge.width + r + 8 else { continue }
             let localX = max(0, min(ledge.width, mouseX - ledge.x))
             let pile = surface.height(atLocalX: localX)
-            guard pile > 0.6 else { continue }
+            guard pile > 0.35 else { continue }
             let ground = ledge.y + pile
-            guard mouseY >= ground - r * 0.4, mouseY <= ground + max(reach, r * 0.85) else { continue }
+            // Generous vertical band — big balls sit high above the ledge.
+            guard mouseY >= ground - r * 0.55, mouseY <= ground + max(reach, r * 1.15 + 24) else { continue }
 
-            // Modest scoop — size comes from distance traveled, not one swipe.
-            let scoopRadius = min(9, 3.5 + r * 0.18)
+            let scoopRadius = min(16, 3.5 + r * 0.14)
             let scooped = surface.scoop(atLocalX: localX, radius: scoopRadius)
-            gainedTotal += scooped * 0.22
-            if travel > 0.8, scooped > 0.04 {
-                gainedTotal += travel * 0.08
+            gainedTotal += scooped * 0.12 * sizeSlow
+            if travel > 0.6, scooped > 0.03 {
+                gainedTotal += travel * 0.14 * sizeSlow
             }
             surfaces[id] = surface
         }
@@ -2482,7 +2706,8 @@ final class SnowSimulator {
         }
 
         guard balls.count < maxBalls, rollCooldown <= 0 else { return }
-        let initial = min(ballMaxMass, max(8, formingMass * 0.45))
+        // Fresh balls stay small — growth comes from rolling, not spawn scoop.
+        let initial = min(28, max(8, formingMass * 0.28))
         balls.append(
             Snowball(
                 x: x,
@@ -2527,6 +2752,13 @@ final class SnowSimulator {
             let flightSpeed = hypot(balls[i].vx, balls[i].vy)
             let inFlight = flightSpeed > 90
             let justThrown = throwIgnoreSettle.contains(i)
+            // Any real throw: skim past windows instead of vanishing into chrome.
+            let flyingThrow = !supportsStack && (justThrown || inFlight || flightSpeed > 70)
+            // Strong sideways throw toward a screen edge → commit to LAN handoff.
+            let handoffFlight = lanHandoffEnabled
+                && flyingThrow
+                && abs(balls[i].vx) > 120
+                && abs(balls[i].vx) >= abs(balls[i].vy) * 0.55
             // Horizontal throws start near the pile — don't soft-stick until they leave.
             if justThrown, inFlight || abs(balls[i].vx) > 70 || balls[i].vy > 40 {
                 // Still carrying the throw — keep ignore flag.
@@ -2556,7 +2788,8 @@ final class SnowSimulator {
             }
 
             // Never linger inside a fullscreen app — melt immediately.
-            if isInsideMaximized(x: balls[i].x, y: balls[i].y) {
+            // Flying throws may skim past maximized chrome.
+            if !flyingThrow, isInsideMaximized(x: balls[i].x, y: balls[i].y) {
                 balls[i].mass = 0
                 continue
             }
@@ -2566,12 +2799,14 @@ final class SnowSimulator {
             let steps = 4
             let stepDt = dt / Float(steps)
             var rested = false
+            // Giant balls use a tiny collide radius while airborne so they don't eat every window.
+            let collideR = flyingThrow ? min(r, 18) : r
             for _ in 0..<steps {
                 let yBefore = balls[i].y
                 balls[i].x += balls[i].vx * stepDt
                 balls[i].y += balls[i].vy * stepDt
 
-                if isInsideMaximized(x: balls[i].x, y: balls[i].y) {
+                if !flyingThrow, isInsideMaximized(x: balls[i].x, y: balls[i].y) {
                     balls[i].mass = 0
                     rested = true
                     break
@@ -2579,48 +2814,54 @@ final class SnowSimulator {
 
                 let stepSpeed = hypot(balls[i].vx, balls[i].vy)
 
-                // Land on window tops first.
-                for ledge in sorted {
-                    if CACurrentMediaTime() < (noSettleUntil[ledge.id] ?? 0) { continue }
-                    let pad = max(6, r * 0.45)
-                    guard balls[i].x >= ledge.x - pad, balls[i].x <= ledge.x + ledge.width + pad else {
-                        continue
+                // Land on window tops first — skip while committed to an edge throw.
+                if !handoffFlight {
+                    for ledge in sorted {
+                        if CACurrentMediaTime() < (noSettleUntil[ledge.id] ?? 0) { continue }
+                        let pad = max(6, r * 0.45)
+                        guard balls[i].x >= ledge.x - pad, balls[i].x <= ledge.x + ledge.width + pad else {
+                            continue
+                        }
+                        let localX = max(0, min(ledge.width, balls[i].x - ledge.x))
+                        let pile = surfaces[ledge.id]?.height(atLocalX: localX) ?? 0
+                        let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: r)
+                        // Still rising hard past the seat — let it arc over.
+                        if balls[i].vy > 50, balls[i].y > ground + r * 0.5 { continue }
+                        // Tunnel-proof catch: any descent that crosses the seat.
+                        let catchPad = max(8, abs(balls[i].vy) * stepDt + r * 0.35)
+                        let crossed = balls[i].vy <= 20
+                            && yBefore >= ground - 2
+                            && balls[i].y <= ground + catchPad
+                        // Soft overlap catch — skip while a throw is still leaving the ledge.
+                        let allowSoftLand = !justThrown && !inFlight && abs(balls[i].vx) < 110
+                        let overlapping = allowSoftLand
+                            && balls[i].vy <= 40
+                            && balls[i].y <= ground + max(10, r * 1.1)
+                            && balls[i].y >= ground - max(10, r * 0.95)
+                        if crossed || overlapping {
+                            balls[i].y = ground
+                            balls[i].vy = 0
+                            balls[i].vx *= supportsStack ? 0.5 : 0.82
+                            if supportsStack || abs(balls[i].vx) < 12 { balls[i].vx = 0 }
+                            balls[i].restingLedge = ledge.id
+                            throwIgnoreSettle.remove(i)
+                            rested = true
+                            break
+                        }
                     }
-                    let localX = max(0, min(ledge.width, balls[i].x - ledge.x))
-                    let pile = surfaces[ledge.id]?.height(atLocalX: localX) ?? 0
-                    let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: r)
-                    // Still rising hard past the seat — let it arc over.
-                    if balls[i].vy > 50, balls[i].y > ground + r * 0.5 { continue }
-                    // Tunnel-proof catch: any descent that crosses the seat.
-                    let catchPad = max(8, abs(balls[i].vy) * stepDt + r * 0.35)
-                    let crossed = balls[i].vy <= 20
-                        && yBefore >= ground - 2
-                        && balls[i].y <= ground + catchPad
-                    // Soft overlap catch — skip while a throw is still leaving the ledge.
-                    let allowSoftLand = !justThrown && !inFlight && abs(balls[i].vx) < 110
-                    let overlapping = allowSoftLand
-                        && balls[i].vy <= 40
-                        && balls[i].y <= ground + max(10, r * 1.1)
-                        && balls[i].y >= ground - max(10, r * 0.95)
-                    if crossed || overlapping {
-                        balls[i].y = ground
-                        balls[i].vy = 0
-                        balls[i].vx *= supportsStack ? 0.5 : 0.82
-                        if supportsStack || abs(balls[i].vx) < 12 { balls[i].vx = 0 }
-                        balls[i].restingLedge = ledge.id
-                        throwIgnoreSettle.remove(i)
-                        rested = true
-                        break
-                    }
+                    if rested { break }
                 }
-                if rested { break }
 
-                // Contact with window glass / sides / bottom → always shatter into snow.
-                // (Bouncing parked the ball on the top edge and looked broken when
-                // releasing a snowball in the middle of a window.)
+                // Glass hit → shatter. Slow drops near the top settle instead (for stacking).
                 var shattered = false
                 for win in bodyOccluders {
-                    if circleOverlapsWindowBody(win, x: balls[i].x, y: balls[i].y, radius: r) {
+                    if shouldShatterBall(
+                        against: win,
+                        x: balls[i].x,
+                        y: balls[i].y,
+                        radius: collideR,
+                        speed: stepSpeed
+                    ) {
                         shatterBallIntoSnow(ballIndex: i, against: win)
                         shattered = true
                         rested = true
@@ -2670,8 +2911,9 @@ final class SnowSimulator {
             }
 
             // Fast horizontal exit → hand off to a LAN peer (or melt).
+            // Cap exit padding so giant balls don't need to fly a whole screen past the edge.
             if lanHandoffEnabled, !supportsStack, flightSpeed > 120 {
-                let rExit = balls[i].radius
+                let rExit = min(40, max(16, balls[i].radius * 0.25))
                 if balls[i].x < worldMinX - rExit, balls[i].vx < -60 {
                     let h = max(1, worldMaxY - worldMinY)
                     let normY = min(1, max(0, (balls[i].y - worldMinY) / h))
@@ -2769,6 +3011,11 @@ final class SnowSimulator {
             // Free physics like balls — can be thrown off a ledge, no hard pin.
             snowmen[i].vy -= 620 * dt
             snowmen[i].vx *= 0.988
+            let hasSign = !snowmen[i].signText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let handoffFlight = lanHandoffEnabled
+                && hasSign
+                && abs(snowmen[i].vx) > 140
+                && abs(snowmen[i].vx) >= abs(snowmen[i].vy) * 0.75
             let steps = 4
             let stepDt = dt / Float(steps)
             var rested = false
@@ -2777,7 +3024,7 @@ final class SnowSimulator {
                 snowmen[i].x += snowmen[i].vx * stepDt
                 snowmen[i].y += snowmen[i].vy * stepDt
 
-                if isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y) {
+                if !handoffFlight, isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y) {
                     snowmen[i].baseMass = 0
                     rested = true
                     break
@@ -2786,56 +3033,60 @@ final class SnowSimulator {
                 // Fast throw: skip soft sitting so he can leave the ledge.
                 let fast = hypot(snowmen[i].vx, snowmen[i].vy) > 120
 
-                for ledge in sorted {
-                    if CACurrentMediaTime() < (noSettleUntil[ledge.id] ?? 0) { continue }
-                    let pad = snowmen[i].baseR * 0.35
-                    guard snowmen[i].x >= ledge.x - pad, snowmen[i].x <= ledge.x + ledge.width + pad else { continue }
-                    let pile = surfaces[ledge.id]?.height(atLocalX: snowmen[i].x - ledge.x) ?? 0
-                    let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: snowmen[i].baseR)
-                    let crossed = yBefore >= ground - 2 && snowmen[i].y <= ground + 3 && snowmen[i].vy <= 0
-                    let sitting = !fast
-                        && abs(snowmen[i].y - ground) <= max(4, snowmen[i].baseR * 0.5)
-                        && snowmen[i].vy <= 50
-                        && abs(snowmen[i].vx) < 80
-                    let hoverFix = !fast
-                        && snowmen[i].y > ground
-                        && snowmen[i].y <= ground + snowmen[i].baseR * 1.1
-                        && snowmen[i].vy <= 30
-                    if crossed || sitting || hoverFix {
-                        snowmen[i].y = ground
-                        snowmen[i].vy = 0
-                        snowmen[i].vx *= 0.82
-                        snowmen[i].restingLedge = ledge.id
-                        rested = true
-                        break
+                if !handoffFlight {
+                    for ledge in sorted {
+                        if CACurrentMediaTime() < (noSettleUntil[ledge.id] ?? 0) { continue }
+                        let pad = snowmen[i].baseR * 0.35
+                        guard snowmen[i].x >= ledge.x - pad, snowmen[i].x <= ledge.x + ledge.width + pad else { continue }
+                        let pile = surfaces[ledge.id]?.height(atLocalX: snowmen[i].x - ledge.x) ?? 0
+                        let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: snowmen[i].baseR)
+                        let crossed = yBefore >= ground - 2 && snowmen[i].y <= ground + 3 && snowmen[i].vy <= 0
+                        let sitting = !fast
+                            && abs(snowmen[i].y - ground) <= max(4, snowmen[i].baseR * 0.5)
+                            && snowmen[i].vy <= 50
+                            && abs(snowmen[i].vx) < 80
+                        let hoverFix = !fast
+                            && snowmen[i].y > ground
+                            && snowmen[i].y <= ground + snowmen[i].baseR * 1.1
+                            && snowmen[i].vy <= 30
+                        if crossed || sitting || hoverFix {
+                            snowmen[i].y = ground
+                            snowmen[i].vy = 0
+                            snowmen[i].vx *= 0.82
+                            snowmen[i].restingLedge = ledge.id
+                            rested = true
+                            break
+                        }
                     }
+                    if rested { break }
                 }
-                if rested { break }
 
-                for win in bodyOccluders {
-                    let (wvx, wvy) = windowVelocity(for: win.id, current: win, dt: dt)
-                    var x = snowmen[i].x
-                    var y = snowmen[i].y
-                    var vx = snowmen[i].vx
-                    var vy = snowmen[i].vy
-                    if bounceCircleOffWindow(
-                        win,
-                        x: &x,
-                        y: &y,
-                        vx: &vx,
-                        vy: &vy,
-                        radius: snowmen[i].baseR,
-                        winVX: wvx,
-                        winVY: wvy,
-                        restitution: 0.42,
-                        friction: 0.28
-                    ) {
-                        snowmen[i].x = x
-                        snowmen[i].y = y
-                        snowmen[i].vx = vx
-                        snowmen[i].vy = vy
-                        snowmen[i].restingLedge = nil
-                        break
+                if !handoffFlight {
+                    for win in bodyOccluders {
+                        let (wvx, wvy) = windowVelocity(for: win.id, current: win, dt: dt)
+                        var x = snowmen[i].x
+                        var y = snowmen[i].y
+                        var vx = snowmen[i].vx
+                        var vy = snowmen[i].vy
+                        if bounceCircleOffWindow(
+                            win,
+                            x: &x,
+                            y: &y,
+                            vx: &vx,
+                            vy: &vy,
+                            radius: snowmen[i].baseR,
+                            winVX: wvx,
+                            winVY: wvy,
+                            restitution: 0.42,
+                            friction: 0.28
+                        ) {
+                            snowmen[i].x = x
+                            snowmen[i].y = y
+                            snowmen[i].vx = vx
+                            snowmen[i].vy = vy
+                            snowmen[i].restingLedge = nil
+                            break
+                        }
                     }
                 }
             }
@@ -2851,6 +3102,44 @@ final class SnowSimulator {
 
             if snowmen[i].y < worldMinY - 120 {
                 snowmen[i].baseMass = 0
+                continue
+            }
+
+            // Signed snowman flung past a screen edge → LAN handoff.
+            let sign = snowmen[i].signText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let speed = hypot(snowmen[i].vx, snowmen[i].vy)
+            if lanHandoffEnabled, !sign.isEmpty, !snowmen[i].held, speed > 120 {
+                let rExit: Float = 28
+                if snowmen[i].x < worldMinX - rExit, snowmen[i].vx < -60 {
+                    let h = max(1, worldMaxY - worldMinY)
+                    let normY = min(1, max(0, (snowmen[i].y - worldMinY) / h))
+                    pendingSnowmanExits.append(
+                        OutboundSnowman(
+                            edge: .left,
+                            normY: normY,
+                            vx: snowmen[i].vx,
+                            vy: snowmen[i].vy,
+                            signText: sign
+                        )
+                    )
+                    snowmen[i].baseMass = 0
+                    continue
+                }
+                if snowmen[i].x > worldMaxX + rExit, snowmen[i].vx > 60 {
+                    let h = max(1, worldMaxY - worldMinY)
+                    let normY = min(1, max(0, (snowmen[i].y - worldMinY) / h))
+                    pendingSnowmanExits.append(
+                        OutboundSnowman(
+                            edge: .right,
+                            normY: normY,
+                            vx: snowmen[i].vx,
+                            vy: snowmen[i].vy,
+                            signText: sign
+                        )
+                    )
+                    snowmen[i].baseMass = 0
+                    continue
+                }
             }
         }
 
@@ -2908,12 +3197,16 @@ final class SnowSimulator {
     private func updateLanImpacts(dt: Float) {
         guard !lanImpacts.isEmpty else {
             lanOverlayUpload.removeAll(keepingCapacity: true)
+            lanFlakeUpload.removeAll(keepingCapacity: true)
+            lanSoftBallPositions.removeAll(keepingCapacity: true)
+            lanSoftBallLocalOp.removeAll(keepingCapacity: true)
             return
         }
         var next: [LanImpact] = []
         next.reserveCapacity(lanImpacts.count)
         for var hit in lanImpacts {
             hit.age += dt
+            let big = hit.coverage >= 0.45
             switch hit.phase {
             case .flying:
                 hit.bx += hit.bvx * dt
@@ -2922,16 +3215,18 @@ final class SnowSimulator {
                 let dy = hit.y - hit.by
                 let dist = hypot(dx, dy)
                 let step = hypot(hit.bvx, hit.bvy) * dt
-                if dist <= max(14, step + hit.radius * 0.35) || hit.age > 1.4 {
+                let flightCap: Float = big ? 0.85 : 1.4
+                if dist <= max(14, step + hit.radius * 0.35) || hit.age > flightCap {
                     hit.bx = hit.x
                     hit.by = hit.y
                     hit.phase = .exploding
                     hit.age = 0
-                    hit.burst = makeLanBurst(atX: hit.x, y: hit.y, radius: hit.radius)
+                    hit.burst = makeLanBurst(atX: hit.x, y: hit.y, radius: hit.radius, big: big)
                 }
             case .exploding:
                 integrateLanBurst(&hit.burst, dt: dt)
-                if hit.age > 0.18 {
+                // Same timing for small and big — big just scales the spray.
+                if hit.age > 0.2 {
                     hit.phase = .staining
                     hit.stainAge = 0
                 }
@@ -2948,22 +3243,69 @@ final class SnowSimulator {
         rebuildLanOverlayUpload()
     }
 
-    private func makeLanBurst(atX x: Float, y: Float, radius: Float) -> [LanImpact.BurstBit] {
-        let count = Int.random(in: 22...34, using: &rng)
+    private func makeLanBurst(atX x: Float, y: Float, radius: Float, big: Bool) -> [LanImpact.BurstBit] {
+        // Same recipe as the pretty small hit — only counts / speeds scale up.
+        let scale = big ? min(3.8, max(1.8, radius / 40)) : 1
+        let gritCount = Int((Float.random(in: 20...30, using: &rng) * scale).rounded())
+        let flakeCount = Int((Float.random(in: 10...16, using: &rng) * scale).rounded())
+        let clumpCount = big ? Int.random(in: 10...16, using: &rng) : 0
         var bits: [LanImpact.BurstBit] = []
-        bits.reserveCapacity(count)
-        for _ in 0..<count {
+        bits.reserveCapacity(gritCount + flakeCount + clumpCount)
+
+        // Soft snow grit — this is what makes the small break look good.
+        for _ in 0..<gritCount {
             let angle = Float.random(in: 0...(2 * .pi), using: &rng)
-            let speed = Float.random(in: 180...520, using: &rng) * (0.65 + radius / 40)
+            let speed = Float.random(in: 180...520, using: &rng) * (0.7 + min(2.2, radius / 55))
             bits.append(
                 LanImpact.BurstBit(
-                    x: x + Float.random(in: -radius * 0.2...radius * 0.2, using: &rng),
-                    y: y + Float.random(in: -radius * 0.2...radius * 0.2, using: &rng),
+                    x: x + Float.random(in: -radius * 0.22...radius * 0.22, using: &rng),
+                    y: y + Float.random(in: -radius * 0.22...radius * 0.22, using: &rng),
                     vx: cosf(angle) * speed,
-                    vy: sinf(angle) * speed + Float.random(in: 40...160, using: &rng),
-                    size: Float.random(in: 2.2...5.5, using: &rng),
+                    vy: sinf(angle) * speed + Float.random(in: 50...180, using: &rng),
+                    size: Float.random(in: 2.2...5.4, using: &rng),
                     life: 0,
-                    maxLife: Float.random(in: 0.35...0.75, using: &rng)
+                    maxLife: Float.random(in: 0.4...0.85, using: &rng),
+                    asFlake: false,
+                    phase: 0
+                )
+            )
+        }
+
+        // Crystal snowflakes mixed into the spray.
+        for _ in 0..<flakeCount {
+            let angle = Float.random(in: 0...(2 * .pi), using: &rng)
+            let dist = Float.random(in: 0...(radius * 0.35), using: &rng)
+            let speed = Float.random(in: 160...560, using: &rng) * (0.65 + min(1.8, radius / 70))
+            bits.append(
+                LanImpact.BurstBit(
+                    x: x + cosf(angle) * dist,
+                    y: y + sinf(angle) * dist,
+                    vx: cosf(angle) * speed + Float.random(in: -40...40, using: &rng),
+                    vy: sinf(angle) * speed + Float.random(in: 60...220, using: &rng),
+                    size: Float.random(in: 2.2...5.8, using: &rng),
+                    life: 0,
+                    maxLife: Float.random(in: 0.55...1.25, using: &rng),
+                    asFlake: true,
+                    phase: Float.random(in: 0...(2 * .pi), using: &rng)
+                )
+            )
+        }
+
+        // Bigger soft clumps for giant hits (mini snowballs flying off).
+        for _ in 0..<clumpCount {
+            let angle = Float.random(in: 0...(2 * .pi), using: &rng)
+            let speed = Float.random(in: 140...420, using: &rng)
+            bits.append(
+                LanImpact.BurstBit(
+                    x: x + Float.random(in: -radius * 0.35...radius * 0.35, using: &rng),
+                    y: y + Float.random(in: -radius * 0.35...radius * 0.35, using: &rng),
+                    vx: cosf(angle) * speed,
+                    vy: sinf(angle) * speed + Float.random(in: 40...140, using: &rng),
+                    size: Float.random(in: 7...14, using: &rng),
+                    life: 0,
+                    maxLife: Float.random(in: 0.45...0.9, using: &rng),
+                    asFlake: false,
+                    phase: 0
                 )
             )
         }
@@ -2976,8 +3318,16 @@ final class SnowSimulator {
         for var bit in burst {
             bit.life += dt
             guard bit.life < bit.maxLife else { continue }
-            bit.vy -= 780 * dt
-            bit.vx *= max(0, 1 - 1.6 * dt)
+            if bit.asFlake {
+                bit.phase += dt * (6.5 + bit.size * 0.35)
+                bit.vy -= 280 * dt
+                bit.vx += sinf(bit.phase) * (50 + bit.size * 3.5) * dt
+                bit.vx *= max(0, 1 - 0.6 * dt)
+                bit.vy *= max(0, 1 - 0.1 * dt)
+            } else {
+                bit.vy -= 780 * dt
+                bit.vx *= max(0, 1 - 1.6 * dt)
+            }
             bit.x += bit.vx * dt
             bit.y += bit.vy * dt
             alive.append(bit)
@@ -2987,33 +3337,131 @@ final class SnowSimulator {
 
     private func rebuildLanOverlayUpload() {
         lanOverlayUpload.removeAll(keepingCapacity: true)
-        lanOverlayUpload.reserveCapacity(lanImpacts.count * 12)
+        lanFlakeUpload.removeAll(keepingCapacity: true)
+        lanSoftBallPositions.removeAll(keepingCapacity: true)
+        lanSoftBallLocalOp.removeAll(keepingCapacity: true)
+        lanOverlayUpload.reserveCapacity(lanImpacts.count * 24)
+        lanFlakeUpload.reserveCapacity(lanImpacts.count * 80)
         for hit in lanImpacts {
             switch hit.phase {
             case .flying:
-                lanOverlayUpload.append(SIMD4(hit.bx, hit.by, hit.radius * 2.0, 1.0))
+                appendSnowballVisual(
+                    x: hit.bx,
+                    y: hit.by,
+                    radius: hit.radius,
+                    opacity: 1.0,
+                    pointBuffer: &lanOverlayUpload,
+                    meshPos: &lanSoftBallPositions,
+                    meshLocal: &lanSoftBallLocalOp
+                )
             case .exploding:
-                // Shrinking flash of the ball + expanding soft shock.
-                let t = min(1, hit.age / 0.18)
-                let flash = hit.radius * 2.0 * (1.2 - t * 0.55)
-                // Keep opacity ≥ 0.89 so the ball uses solid snow shading, not stain.
-                lanOverlayUpload.append(SIMD4(hit.x, hit.y, flash, max(0.89, 1 - t * 0.4)))
-                lanOverlayUpload.append(SIMD4(hit.x, hit.y, hit.radius * (2.8 + t * 4.0), 0.55 * (1 - t)))
+                // Identical break recipe for every size: flash + soft shock.
+                let t = min(1, hit.age / 0.2)
+                let flashR = hit.radius * (1.18 - t * 0.55)
+                appendSnowballVisual(
+                    x: hit.x,
+                    y: hit.y,
+                    radius: flashR,
+                    opacity: max(0.89, 1 - t * 0.42),
+                    pointBuffer: &lanOverlayUpload,
+                    meshPos: &lanSoftBallPositions,
+                    meshLocal: &lanSoftBallLocalOp
+                )
+                appendShockOrStain(
+                    x: hit.x,
+                    y: hit.y,
+                    radius: hit.radius * (1.45 + t * 2.1),
+                    opacity: 0.52 * (1 - t)
+                )
             case .staining:
                 let fade = max(0, 1 - hit.stainAge / hit.stainLifetime)
-                // Soft irregular snow stain — several overlapping blotches.
-                let stainAlpha = 0.82 * powf(fade, 1.35)
+                let stainAlpha = 0.8 * powf(fade, 1.3)
                 for blotch in hit.blotches {
-                    let diam = hit.radius * 2.8 * blotch.scale
-                    lanOverlayUpload.append(
-                        SIMD4(hit.x + blotch.dx, hit.y + blotch.dy, diam, min(0.87, stainAlpha * (0.6 + 0.4 * blotch.scale)))
+                    let r = hit.radius * 1.25 * blotch.scale
+                    appendShockOrStain(
+                        x: hit.x + blotch.dx,
+                        y: hit.y + blotch.dy,
+                        radius: r,
+                        opacity: min(0.87, stainAlpha * (0.55 + 0.4 * blotch.scale))
                     )
                 }
             }
             for bit in hit.burst {
                 let fade = max(0, 1 - bit.life / bit.maxLife)
-                lanOverlayUpload.append(SIMD4(bit.x, bit.y, bit.size * 2.4, min(0.95, 0.95 * fade)))
+                let op = min(0.98, fade * (bit.asFlake ? 1.0 : 0.95))
+                if bit.asFlake {
+                    lanFlakeUpload.append(SIMD4(bit.x, bit.y, bit.size, op))
+                } else {
+                    // Keep grit on the lit snowball shader (opacity ≥ 0.89).
+                    lanOverlayUpload.append(SIMD4(bit.x, bit.y, bit.size * 2.4, max(0.89, op)))
+                }
             }
+        }
+    }
+
+    /// Solid snowball: small → point sprite; large → lit triangle fan (no ugly tiling).
+    private func appendSnowballVisual(
+        x: Float,
+        y: Float,
+        radius: Float,
+        opacity: Float,
+        pointBuffer: inout [SIMD4<Float>],
+        meshPos: inout [SIMD2<Float>],
+        meshLocal: inout [SIMD4<Float>]
+    ) {
+        let op = max(0.89, min(1, opacity))
+        if radius <= 52 {
+            pointBuffer.append(SIMD4(x, y, radius * 2.0, op))
+        } else {
+            appendSoftBallFan(x: x, y: y, radius: radius, opacity: op, positions: &meshPos, localOp: &meshLocal)
+        }
+    }
+
+    /// Soft wet shock / stain — points when small, lit mesh when large.
+    private func appendShockOrStain(x: Float, y: Float, radius: Float, opacity: Float) {
+        let op = min(0.87, max(0, opacity))
+        guard op > 0.02, radius > 1 else { return }
+        if radius <= 90 {
+            lanOverlayUpload.append(SIMD4(x, y, radius * 2.0, op))
+        } else {
+            appendSoftBallFan(
+                x: x,
+                y: y,
+                radius: radius,
+                opacity: op,
+                positions: &lanSoftBallPositions,
+                localOp: &lanSoftBallLocalOp
+            )
+        }
+    }
+
+    /// Triangle fan with local coords for the soft lit snowball fragment shader.
+    private func appendSoftBallFan(
+        x: Float,
+        y: Float,
+        radius: Float,
+        opacity: Float,
+        positions: inout [SIMD2<Float>],
+        localOp: inout [SIMD4<Float>]
+    ) {
+        let segs = radius > 160 ? 64 : 48
+        let center = SIMD2<Float>(x, y)
+        let centerAttr = SIMD4<Float>(0, 0, opacity, 0)
+        for i in 0..<segs {
+            let a0 = Float(i) / Float(segs) * (2 * Float.pi)
+            let a1 = Float(i + 1) / Float(segs) * (2 * Float.pi)
+            let c0 = cosf(a0)
+            let s0 = sinf(a0)
+            let c1 = cosf(a1)
+            let s1 = sinf(a1)
+            let p0 = SIMD2(x + c0 * radius, y + s0 * radius)
+            let p1 = SIMD2(x + c1 * radius, y + s1 * radius)
+            positions.append(contentsOf: [center, p0, p1])
+            localOp.append(contentsOf: [
+                centerAttr,
+                SIMD4(c0, s0, opacity, 0),
+                SIMD4(c1, s1, opacity, 0)
+            ])
         }
     }
 
@@ -3028,6 +3476,8 @@ final class SnowSimulator {
 
         ballUpload.removeAll(keepingCapacity: true)
         decorUpload.removeAll(keepingCapacity: true)
+        softBallPositions.removeAll(keepingCapacity: true)
+        softBallLocalOp.removeAll(keepingCapacity: true)
         ballUpload.reserveCapacity(balls.count + snowmen.count * 3)
         for b in balls {
             if !b.held {
@@ -3043,8 +3493,15 @@ final class SnowSimulator {
                 }
             }
             let alpha: Float = b.held ? 1.0 : 0.98
-            // z = diameter in points (shader multiplies by backing scale).
-            ballUpload.append(SIMD4<Float>(b.x, b.y, b.radius * 2.0, alpha))
+            appendSnowballVisual(
+                x: b.x,
+                y: b.y,
+                radius: b.radius,
+                opacity: alpha,
+                pointBuffer: &ballUpload,
+                meshPos: &softBallPositions,
+                meshLocal: &softBallLocalOp
+            )
         }
 
         propVertices.removeAll(keepingCapacity: true)
@@ -3170,7 +3627,39 @@ final class SnowSimulator {
         appendCarrotNose(s)
         appendBranchArm(s, left: true)
         appendBranchArm(s, left: false)
+        if !s.signText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            appendSignBoard(s)
+        }
         appendBucketHat(s)
+    }
+
+    /// Wooden placard in the right hand (text is drawn by an AppKit HUD label).
+    private func appendSignBoard(_ s: Snowman) {
+        let wood = SIMD4<Float>(0.72, 0.55, 0.32, 1)
+        let woodDark = SIMD4<Float>(0.48, 0.32, 0.16, 1)
+        let stick = SIMD4<Float>(0.40, 0.24, 0.12, 1)
+        let a = s.signAnchor
+        let w = max(22, s.midR * 2.4)
+        let h = max(14, s.midR * 1.35)
+        let poleTop = a.y - h * 0.15
+        let hand = SIMD2(s.x + s.midR * 0.95, s.midY + s.midR * 0.25)
+        appendStick(x0: hand.x, y0: hand.y, x1: a.x, y1: poleTop, thickness: 1.4, color: stick)
+        appendQuad(
+            x0: a.x - w * 0.5, y0: a.y - h * 0.5,
+            x1: a.x + w * 0.5, y1: a.y - h * 0.5,
+            x2: a.x + w * 0.5, y2: a.y + h * 0.5,
+            x3: a.x - w * 0.5, y3: a.y + h * 0.5,
+            color: wood
+        )
+        // Inner lighter face.
+        let inset: Float = 2.2
+        appendQuad(
+            x0: a.x - w * 0.5 + inset, y0: a.y - h * 0.5 + inset,
+            x1: a.x + w * 0.5 - inset, y1: a.y - h * 0.5 + inset,
+            x2: a.x + w * 0.5 - inset, y2: a.y + h * 0.5 - inset,
+            x3: a.x - w * 0.5 + inset, y3: a.y + h * 0.5 - inset,
+            color: woodDark
+        )
     }
 
     private func appendCarrotNose(_ s: Snowman) {
