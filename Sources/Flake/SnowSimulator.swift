@@ -277,6 +277,11 @@ final class SnowSimulator {
     private(set) var flakeUpload: [SIMD4<Float>] = []
     private(set) var ballUpload: [SIMD4<Float>] = []
     private(set) var decorUpload: [SIMD4<Float>] = []
+
+    /// Snowballs that left the left/right desktop edge this frame (LAN handoff).
+    private(set) var pendingEdgeExits: [OutboundSnowball] = []
+    /// When false, edge exits melt locally instead of being offered to peers.
+    var lanHandoffEnabled = false
     private(set) var driftVertices: [SIMD2<Float>] = []
     private(set) var driftColors: [SIMD4<Float>] = []
     private(set) var driftStripCounts: [Int] = []
@@ -396,6 +401,51 @@ final class SnowSimulator {
         return false
     }
 
+    func consumeEdgeExits() -> [OutboundSnowball] {
+        let exits = pendingEdgeExits
+        pendingEdgeExits.removeAll(keepingCapacity: true)
+        return exits
+    }
+
+    /// Spawn a snowball arriving from a peer across the matching screen edge.
+    @discardableResult
+    func spawnInboundSnowball(
+        entryEdge: SnowEdge,
+        normY: Float,
+        vx: Float,
+        vy: Float,
+        mass: Float
+    ) -> Bool {
+        guard balls.count < maxBalls else { return false }
+        let clampedMass = min(ballMaxMass, max(8, mass))
+        let r = max(6, min(36, 4.2 + sqrtf(clampedMass) * 1.65))
+        let y = worldMinY + min(1, max(0, normY)) * max(1, worldMaxY - worldMinY)
+        let x: Float
+        var inboundVX = vx
+        switch entryEdge {
+        case .left:
+            x = worldMinX + r + 2
+            // Ensure it continues inward.
+            if inboundVX < 40 { inboundVX = max(180, abs(vx)) }
+        case .right:
+            x = worldMaxX - r - 2
+            if inboundVX > -40 { inboundVX = -max(180, abs(vx)) }
+        }
+        balls.append(
+            Snowball(
+                x: x,
+                y: min(worldMaxY - r, max(worldMinY + r, y)),
+                vx: inboundVX,
+                vy: vy,
+                mass: clampedMass,
+                held: false,
+                stackedOn: nil,
+                restingLedge: nil
+            )
+        )
+        return true
+    }
+
     func clear() {
         particles.removeAll(keepingCapacity: true)
         surfaces.removeAll(keepingCapacity: true)
@@ -403,6 +453,7 @@ final class SnowSimulator {
         prevWindowPose.removeAll(keepingCapacity: true)
         balls.removeAll(keepingCapacity: true)
         snowmen.removeAll(keepingCapacity: true)
+        pendingEdgeExits.removeAll(keepingCapacity: true)
         heldBallIndex = nil
         rollingBallIndex = nil
         heldSnowmanIndex = nil
@@ -1993,6 +2044,42 @@ final class SnowSimulator {
 
             if balls[i].y < worldMinY - 80 {
                 balls[i].mass = 0
+                continue
+            }
+
+            // Fast horizontal exit → hand off to a LAN peer (or melt).
+            if lanHandoffEnabled, !supportsStack, flightSpeed > 120 {
+                let rExit = balls[i].radius
+                if balls[i].x < worldMinX - rExit, balls[i].vx < -60 {
+                    let h = max(1, worldMaxY - worldMinY)
+                    let normY = min(1, max(0, (balls[i].y - worldMinY) / h))
+                    pendingEdgeExits.append(
+                        OutboundSnowball(
+                            edge: .left,
+                            normY: normY,
+                            vx: balls[i].vx,
+                            vy: balls[i].vy,
+                            mass: balls[i].mass
+                        )
+                    )
+                    balls[i].mass = 0
+                    continue
+                }
+                if balls[i].x > worldMaxX + rExit, balls[i].vx > 60 {
+                    let h = max(1, worldMaxY - worldMinY)
+                    let normY = min(1, max(0, (balls[i].y - worldMinY) / h))
+                    pendingEdgeExits.append(
+                        OutboundSnowball(
+                            edge: .right,
+                            normY: normY,
+                            vx: balls[i].vx,
+                            vy: balls[i].vy,
+                            mass: balls[i].mass
+                        )
+                    )
+                    balls[i].mass = 0
+                    continue
+                }
             }
         }
 

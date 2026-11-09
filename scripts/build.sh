@@ -15,6 +15,8 @@ swiftc -O -parse-as-library \
   -framework MetalKit \
   -framework Quartz \
   -framework CoreGraphics \
+  -framework Network \
+  -framework CryptoKit \
   Sources/Flake/*.swift \
   -o .build/Flake
 

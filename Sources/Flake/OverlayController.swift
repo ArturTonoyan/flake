@@ -14,6 +14,7 @@ final class OverlayController {
     private var overlays: [ScreenOverlay] = []
     private let simulator = SnowSimulator()
     private let tracker = WindowTracker()
+    let peerNetwork = PeerSnowNetwork()
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var displayLink: CVDisplayLink?
@@ -24,6 +25,8 @@ final class OverlayController {
     private var tickScheduled = false
     private var mouseMonitors: [Any] = []
     private var lastScreenSignature: String = ""
+    private(set) var lanPeers: [PeerInfo] = []
+    var onLanPeersChanged: (() -> Void)?
 
     var isPaused = false
     var intensity: Double = 0.7 {
@@ -32,6 +35,13 @@ final class OverlayController {
     var mouseInteractionEnabled = true {
         didSet { simulator.mouseEnabled = mouseInteractionEnabled }
     }
+    var lanSnowballsEnabled: Bool {
+        get { peerNetwork.isEnabled }
+        set {
+            simulator.lanHandoffEnabled = newValue
+            peerNetwork.setEnabled(newValue)
+        }
+    }
 
     func start() {
         simulator.intensity = Float(intensity)
@@ -39,6 +49,7 @@ final class OverlayController {
         rebuildOverlays()
         startDisplayLink()
         installMouseMonitors()
+        wirePeerNetwork()
 
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -58,6 +69,7 @@ final class OverlayController {
     }
 
     func stop() {
+        peerNetwork.stop()
         stopDisplayLink()
         removeMouseMonitors()
         if let screenObserver {
@@ -67,6 +79,31 @@ final class OverlayController {
             NSWorkspace.shared.notificationCenter.removeObserver(spaceObserver)
         }
         tearDownOverlays()
+    }
+
+    private func wirePeerNetwork() {
+        peerNetwork.onPeersChanged = { [weak self] peers in
+            guard let self else { return }
+            self.lanPeers = peers
+            self.onLanPeersChanged?()
+        }
+        peerNetwork.onInboundSnowball = { [weak self] ball in
+            guard let self else { return }
+            _ = self.simulator.spawnInboundSnowball(
+                entryEdge: ball.entryEdge,
+                normY: ball.normY,
+                vx: ball.vx,
+                vy: ball.vy,
+                mass: ball.mass
+            )
+        }
+        let saved = UserDefaults.standard.bool(forKey: PeerSnowNetwork.defaultsKeyEnabled)
+        simulator.lanHandoffEnabled = saved
+        peerNetwork.restoreFromDefaults()
+    }
+
+    func setPeerSide(_ side: PeerRelativeSide, peerID: UInt64) {
+        peerNetwork.setSide(side, forPeerID: peerID)
     }
 
     private func installMouseMonitors() {
@@ -265,6 +302,11 @@ final class OverlayController {
         if !isPaused {
             updateWorldBounds()
             simulator.update(dt: dt, windows: tracker.windows(active: trackingActive))
+            if lanSnowballsEnabled {
+                for exit in simulator.consumeEdgeExits() {
+                    peerNetwork.sendSnowball(exit)
+                }
+            }
         }
 
         for item in overlays {

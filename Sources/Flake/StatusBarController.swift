@@ -6,6 +6,9 @@ final class StatusBarController {
 
     init(overlay: OverlayController) {
         self.overlay = overlay
+        overlay.onLanPeersChanged = { [weak self] in
+            self?.refreshMenu()
+        }
     }
 
     func install() {
@@ -55,6 +58,9 @@ final class StatusBarController {
         menu.addItem(mouse)
 
         menu.addItem(.separator())
+        menu.addItem(buildLanMenuItem())
+
+        menu.addItem(.separator())
 
         let clear = NSMenuItem(title: "Растаять всё", action: #selector(clearSnow), keyEquivalent: "r")
         clear.target = self
@@ -67,6 +73,14 @@ final class StatusBarController {
         )
         tip.isEnabled = false
         menu.addItem(tip)
+
+        let lanTip = NSMenuItem(
+            title: "Кинь снежок за край экрана → другу по Wi‑Fi",
+            action: nil,
+            keyEquivalent: ""
+        )
+        lanTip.isEnabled = false
+        menu.addItem(lanTip)
 
         let permission = NSMenuItem(
             title: "Разрешение «Запись экрана»…",
@@ -83,6 +97,84 @@ final class StatusBarController {
         menu.addItem(quit)
 
         return menu
+    }
+
+    private func buildLanMenuItem() -> NSMenuItem {
+        let peers = overlay.lanPeers.filter(\.isReachable)
+        let count = peers.count
+        let title: String
+        if !overlay.lanSnowballsEnabled {
+            title = "Снежки по Wi‑Fi: выкл"
+        } else if count == 0 {
+            title = "Снежки по Wi‑Fi: ищем…"
+        } else {
+            title = "Снежки по Wi‑Fi: \(count)"
+        }
+
+        let root = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+
+        let toggle = NSMenuItem(
+            title: overlay.lanSnowballsEnabled ? "Выключить" : "Включить",
+            action: #selector(toggleLan),
+            keyEquivalent: ""
+        )
+        toggle.target = self
+        toggle.state = overlay.lanSnowballsEnabled ? .on : .off
+        sub.addItem(toggle)
+
+        if overlay.lanSnowballsEnabled {
+            sub.addItem(.separator())
+
+            let header = NSMenuItem(
+                title: count == 0 ? "Никого рядом в сети" : "Сейчас активны:",
+                action: nil,
+                keyEquivalent: ""
+            )
+            header.isEnabled = false
+            sub.addItem(header)
+
+            for peer in peers {
+                let peerItem = NSMenuItem(title: peer.name, action: nil, keyEquivalent: "")
+                let peerMenu = NSMenu()
+
+                let status = NSMenuItem(title: "Подключён", action: nil, keyEquivalent: "")
+                status.isEnabled = false
+                status.state = .on
+                peerMenu.addItem(status)
+                peerMenu.addItem(.separator())
+
+                let sideHeader = NSMenuItem(title: "Сторона экрана", action: nil, keyEquivalent: "")
+                sideHeader.isEnabled = false
+                peerMenu.addItem(sideHeader)
+
+                for (label, side) in [
+                    ("Авто", PeerRelativeSide.auto),
+                    ("Слева от меня", PeerRelativeSide.left),
+                    ("Справа от меня", PeerRelativeSide.right),
+                ] as [(String, PeerRelativeSide)] {
+                    let item = NSMenuItem(title: label, action: #selector(setPeerSide(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = PeerSideChoice(peerID: peer.id, side: side)
+                    item.state = peer.side == side ? .on : .off
+                    peerMenu.addItem(item)
+                }
+
+                peerItem.submenu = peerMenu
+                sub.addItem(peerItem)
+            }
+
+            let hint = NSMenuItem(
+                title: "Бросок за левый/правый край → к ним",
+                action: nil,
+                keyEquivalent: ""
+            )
+            hint.isEnabled = false
+            sub.addItem(hint)
+        }
+
+        root.submenu = sub
+        return root
     }
 
     private func refreshMenu() {
@@ -105,6 +197,17 @@ final class StatusBarController {
         refreshMenu()
     }
 
+    @objc private func toggleLan() {
+        overlay.lanSnowballsEnabled.toggle()
+        refreshMenu()
+    }
+
+    @objc private func setPeerSide(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? PeerSideChoice else { return }
+        overlay.setPeerSide(choice.side, peerID: choice.peerID)
+        refreshMenu()
+    }
+
     @objc private func clearSnow() {
         overlay.clearSnow()
     }
@@ -118,5 +221,16 @@ final class StatusBarController {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+}
+
+/// NSMenuItem.representedObject helper for peer side picks.
+private final class PeerSideChoice: NSObject {
+    let peerID: UInt64
+    let side: PeerRelativeSide
+
+    init(peerID: UInt64, side: PeerRelativeSide) {
+        self.peerID = peerID
+        self.side = side
     }
 }
