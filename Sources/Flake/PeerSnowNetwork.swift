@@ -41,6 +41,10 @@ struct InboundSnowball {
 
 /// LAN-only Bonjour + UDP snowball exchange.
 ///
+/// Discovery and packets stay on Wi‑Fi / Ethernet / AWDL (interface-scoped),
+/// so an active VPN default route should not carry snowballs — unless the VPN
+/// itself blocks LAN traffic.
+///
 /// Security model (no accounts / registration):
 /// - Advertise only on the local link via Bonjour (`_flake-snow._udp`)
 /// - Accept UDP only from endpoints discovered for known peers
@@ -215,11 +219,7 @@ final class PeerSnowNetwork {
 
     private func startListener() {
         do {
-            let params = NWParameters.udp
-            params.allowLocalEndpointReuse = true
-            params.includePeerToPeer = true
-
-            let listener = try NWListener(using: params)
+            let listener = try NWListener(using: Self.localLinkUDPParameters())
             let tokenHex = localToken.map { String(format: "%02x", $0) }.joined()
             listener.service = NWListener.Service(
                 name: displayName,
@@ -254,9 +254,11 @@ final class PeerSnowNetwork {
     }
 
     private func startBrowser() {
-        let params = NWParameters()
-        params.includePeerToPeer = true
-        let browser = NWBrowser(for: .bonjour(type: Self.serviceType, domain: nil), using: params)
+        // Browse only on Wi‑Fi / Ethernet / AWDL — not on VPN utun tunnels.
+        let browser = NWBrowser(
+            for: .bonjour(type: Self.serviceType, domain: nil),
+            using: Self.localLinkBrowseParameters()
+        )
         browser.stateUpdateHandler = { [weak self] state in
             if case .failed = state {
                 self?.queue.async {
@@ -313,6 +315,8 @@ final class PeerSnowNetwork {
         for result in results {
             guard case let .service(name, type, domain, interface) = result.endpoint else { continue }
             guard type == Self.serviceType || type.hasPrefix("_flake-snow") else { continue }
+            // Skip VPN / tunnel interfaces even if the system surfaces them.
+            if let interface, !Self.isLocalLinkInterface(interface) { continue }
             let txt: NWTXTRecord? = {
                 if case let .bonjour(metadata) = result.metadata {
                     return metadata
@@ -334,6 +338,8 @@ final class PeerSnowNetwork {
 
             seenIDs.insert(peerID)
             let side = resolvedSide(for: peerID)
+            // Pin the Bonjour endpoint to the discovered local interface so UDP
+            // stays on Wi‑Fi even when a VPN owns the default route.
             let endpoint = NWEndpoint.service(name: name, type: type, domain: domain, interface: interface)
 
             if var existing = peers[peerID] {
@@ -384,10 +390,7 @@ final class PeerSnowNetwork {
                 connection.cancel()
             }
         }
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
-        let connection = NWConnection(to: endpoint, using: params)
+        let connection = NWConnection(to: endpoint, using: Self.localLinkUDPParameters())
         connection.stateUpdateHandler = { [weak self] state in
             self?.queue.async {
                 if case .failed = state {
@@ -592,6 +595,49 @@ final class PeerSnowNetwork {
         let snap = peerSnapshot
         DispatchQueue.main.async { [weak self] in
             self?.onPeersChanged?(snap)
+        }
+    }
+
+    // MARK: - Local link (ignore VPN default route)
+
+    /// UDP path constrained to Wi‑Fi / Ethernet / Apple peer-to-peer, not utun VPN.
+    private static func localLinkUDPParameters() -> NWParameters {
+        let params = NWParameters.udp
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+        constrainToLocalLink(params)
+        return params
+    }
+
+    private static func localLinkBrowseParameters() -> NWParameters {
+        let params = NWParameters()
+        params.includePeerToPeer = true
+        constrainToLocalLink(params)
+        return params
+    }
+
+    private static func constrainToLocalLink(_ params: NWParameters) {
+        // Do not prohibit `.other`: AWDL (peer-to-peer Wi‑Fi) often reports as that.
+        // VPN tunnels are filtered by interface name when browsing (see isLocalLinkInterface).
+        params.prohibitedInterfaceTypes = [.loopback, .cellular]
+    }
+
+    private static func isLocalLinkInterface(_ interface: NWInterface) -> Bool {
+        let name = interface.name.lowercased()
+        // Explicit VPN / tunnel device names — never use these for snowballs.
+        if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp")
+            || name.hasPrefix("wg") || name.hasPrefix("tun") || name.hasPrefix("tap")
+        {
+            return false
+        }
+        switch interface.type {
+        case .wifi, .wiredEthernet:
+            return true
+        case .other:
+            // AWDL / LLW are fine; unknown virtual NICs are not.
+            return name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("en")
+        default:
+            return false
         }
     }
 }
