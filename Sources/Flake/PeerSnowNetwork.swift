@@ -22,6 +22,11 @@ struct PeerInfo: Equatable {
     let isReachable: Bool
 }
 
+struct LanThrowRoute: Equatable {
+    let leftName: String?
+    let rightName: String?
+}
+
 struct OutboundSnowball {
     let edge: SnowEdge
     let normY: Float
@@ -32,6 +37,7 @@ struct OutboundSnowball {
 
 struct InboundSnowball {
     let fromPeerID: UInt64
+    let fromName: String
     let entryEdge: SnowEdge
     let normY: Float
     let vx: Float
@@ -63,7 +69,9 @@ final class PeerSnowNetwork {
     private static let typeHeartbeat: UInt8 = 1
     private static let typeSnowball: UInt8 = 2
     private static let typeGoodbye: UInt8 = 3
+    private static let typeAck: UInt8 = 4
     private static let maxSnowballsPerSecond = 12
+    private static let deliveryTimeout: CFTimeInterval = 1.8
     private static let maxAbsVelocity: Float = 2_400
     private static let minMass: Float = 8
     private static let maxMass: Float = 180
@@ -75,14 +83,25 @@ final class PeerSnowNetwork {
 
     private var enabled = false
     private var listener: NWListener?
-    private var browser: NWBrowser?
+    /// NWBrowser omits TXT on current macOS; NetServiceBrowser resolves TXT reliably.
+    private var bonjourBrowser: BonjourPeerBrowser?
     private var peers: [UInt64: PeerState] = [:]
+    /// Names currently advertised on Bonjour (even if UDP heartbeat is quiet).
+    private var bonjourLiveNames = Set<String>()
     private var sideOverrides: [String: String] = [:]
     private var inboundRate: [UInt64: (windowStart: CFTimeInterval, count: Int)] = [:]
     private var heartbeatTimer: DispatchSourceTimer?
+    private var lastEmittedPeers: [PeerInfo] = []
+    private var pendingThrows: [UInt32: PendingThrow] = [:]
+    /// Cached on main for menu: who receives a throw off each edge.
+    private(set) var throwRouteMain = LanThrowRoute(leftName: nil, rightName: nil)
 
     var onPeersChanged: (([PeerInfo]) -> Void)?
     var onInboundSnowball: ((InboundSnowball) -> Void)?
+    /// Peer confirmed the snowball landed on their screen.
+    var onThrowDelivered: ((String) -> Void)?
+    /// No ACK within timeout — likely blocked / offline mid-flight.
+    var onThrowMissed: ((String) -> Void)?
     /// Mirrored on the main thread for UI / simulator toggles.
     private(set) var isEnabledMain = false
 
@@ -95,6 +114,12 @@ final class PeerSnowNetwork {
         var lastSeen: CFTimeInterval
         var lastSeq: UInt32
         var side: PeerRelativeSide
+    }
+
+    private struct PendingThrow {
+        let peerID: UInt64
+        let peerName: String
+        let sentAt: CFTimeInterval
     }
 
     init() {
@@ -115,14 +140,17 @@ final class PeerSnowNetwork {
     var isEnabled: Bool { isEnabledMain }
 
     var peerSnapshot: [PeerInfo] {
-        peers.values
+        let now = CACurrentMediaTime()
+        return peers.values
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             .map {
-                PeerInfo(
+                let bonjourLive = bonjourLiveNames.contains($0.name)
+                let recentlySeen = (now - $0.lastSeen) < 12
+                return PeerInfo(
                     id: $0.id,
                     name: $0.name,
                     side: $0.side,
-                    isReachable: $0.endpoint != nil && (CACurrentMediaTime() - $0.lastSeen) < 12
+                    isReachable: $0.endpoint != nil && (bonjourLive || recentlySeen)
                 )
             }
     }
@@ -135,8 +163,9 @@ final class PeerSnowNetwork {
             if on == self.enabled { return }
             if !on {
                 for peer in self.peers.values {
-                    self.send(type: Self.typeGoodbye, to: peer, edge: .left, normY: 0, vx: 0, vy: 0, mass: 0)
+                    _ = self.send(type: Self.typeGoodbye, to: peer, edge: .left, normY: 0, vx: 0, vy: 0, mass: 0)
                 }
+                self.pendingThrows.removeAll()
             }
             self.enabled = on
             if on {
@@ -156,31 +185,44 @@ final class PeerSnowNetwork {
     func setSide(_ side: PeerRelativeSide, forPeerID id: UInt64) {
         queue.async { [weak self] in
             guard let self else { return }
+            // One peer per side: if A is already "справа", setting B to "справа"
+            // moves A back to Авто — иначе непонятно, кому летит снежок.
+            if side == .left || side == .right {
+                for (otherID, other) in self.peers where otherID != id && other.side == side {
+                    self.peers[otherID]?.side = .auto
+                    self.sideOverrides[String(otherID)] = PeerRelativeSide.auto.rawValue
+                }
+            }
             self.sideOverrides[String(id)] = side.rawValue
             UserDefaults.standard.set(self.sideOverrides, forKey: Self.defaultsKeySides)
             if var peer = self.peers[id] {
                 peer.side = side
                 self.peers[id] = peer
-                self.emitPeersChanged()
             }
+            self.emitPeersChanged()
         }
     }
 
-    /// Throw a snowball that left the local desktop toward peers on that edge.
+    /// Throw a snowball that left the local desktop toward the peer on that edge.
     func sendSnowball(_ ball: OutboundSnowball) {
         queue.async { [weak self] in
             guard let self, self.enabled else { return }
             let targets = self.targets(for: ball.edge)
-            guard !targets.isEmpty else { return }
-            for peer in targets {
-                self.send(
-                    type: Self.typeSnowball,
-                    to: peer,
-                    edge: ball.edge,
-                    normY: ball.normY,
-                    vx: ball.vx,
-                    vy: ball.vy,
-                    mass: ball.mass
+            guard let peer = targets.first else { return }
+            let seq = self.send(
+                type: Self.typeSnowball,
+                to: peer,
+                edge: ball.edge,
+                normY: ball.normY,
+                vx: ball.vx,
+                vy: ball.vy,
+                mass: ball.mass
+            )
+            if let seq {
+                self.pendingThrows[seq] = PendingThrow(
+                    peerID: peer.id,
+                    peerName: peer.name,
+                    sentAt: CACurrentMediaTime()
                 )
             }
         }
@@ -206,15 +248,20 @@ final class PeerSnowNetwork {
     private func stopLocked() {
         heartbeatTimer?.cancel()
         heartbeatTimer = nil
-        browser?.cancel()
-        browser = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.bonjourBrowser?.stop()
+            self?.bonjourBrowser = nil
+        }
         listener?.cancel()
         listener = nil
         for (_, peer) in peers {
             peer.connection?.cancel()
         }
         peers.removeAll()
+        bonjourLiveNames.removeAll()
         inboundRate.removeAll()
+        pendingThrows.removeAll()
+        lastEmittedPeers = []
     }
 
     private func startListener() {
@@ -254,29 +301,18 @@ final class PeerSnowNetwork {
     }
 
     private func startBrowser() {
-        // Browse only on Wi‑Fi / Ethernet / AWDL — not on VPN utun tunnels.
-        let browser = NWBrowser(
-            for: .bonjour(type: Self.serviceType, domain: nil),
-            using: Self.localLinkBrowseParameters()
-        )
-        browser.stateUpdateHandler = { [weak self] state in
-            if case .failed = state {
+        // Must start NetServiceBrowser on a run-loop thread (main).
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.bonjourBrowser?.stop()
+            let browser = BonjourPeerBrowser(serviceType: Self.serviceType) { [weak self] event in
                 self?.queue.async {
-                    self?.browser?.cancel()
-                    self?.browser = nil
-                    if self?.enabled == true {
-                        self?.startBrowser()
-                    }
+                    self?.handleBonjourEvent(event)
                 }
             }
+            self.bonjourBrowser = browser
+            browser.start()
         }
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
-            self?.queue.async {
-                self?.applyBrowseResults(results)
-            }
-        }
-        browser.start(queue: queue)
-        self.browser = browser
     }
 
     private func startHeartbeat() {
@@ -293,11 +329,16 @@ final class PeerSnowNetwork {
         let now = CACurrentMediaTime()
         var stale: [UInt64] = []
         for (id, peer) in peers {
-            if now - peer.lastSeen > 15 {
+            let advertised = bonjourLiveNames.contains(peer.name)
+            // Drop only when Bonjour forgot them AND UDP has been quiet.
+            if !advertised && now - peer.lastSeen > 15 {
                 stale.append(id)
                 continue
             }
-            send(type: Self.typeHeartbeat, to: peer, edge: .left, normY: 0, vx: 0, vy: 0, mass: 0)
+            if peer.connection == nil {
+                ensureConnection(for: id)
+            }
+            _ = send(type: Self.typeHeartbeat, to: peer, edge: .left, normY: 0, vx: 0, vy: 0, mass: 0)
         }
         if !stale.isEmpty {
             for id in stale {
@@ -306,24 +347,28 @@ final class PeerSnowNetwork {
             }
             emitPeersChanged()
         }
+        expirePendingThrows(now: now)
+    }
+
+    private func expirePendingThrows(now: CFTimeInterval) {
+        let timedOut = pendingThrows.filter { now - $0.value.sentAt >= Self.deliveryTimeout }
+        guard !timedOut.isEmpty else { return }
+        for (seq, pending) in timedOut {
+            pendingThrows.removeValue(forKey: seq)
+            let name = pending.peerName
+            DispatchQueue.main.async { [weak self] in
+                self?.onThrowMissed?(name)
+            }
+        }
     }
 
     // MARK: - Discovery
 
-    private func applyBrowseResults(_ results: Set<NWBrowser.Result>) {
-        var seenIDs = Set<UInt64>()
-        for result in results {
-            guard case let .service(name, type, domain, interface) = result.endpoint else { continue }
-            guard type == Self.serviceType || type.hasPrefix("_flake-snow") else { continue }
-            // Skip VPN / tunnel interfaces even if the system surfaces them.
-            if let interface, !Self.isLocalLinkInterface(interface) { continue }
-            let txt: NWTXTRecord? = {
-                if case let .bonjour(metadata) = result.metadata {
-                    return metadata
-                }
-                return nil
-            }()
-            guard let txt else { continue }
+    private func handleBonjourEvent(_ event: BonjourPeerBrowser.Event) {
+        guard enabled else { return }
+        switch event {
+        case let .resolved(name, txt, endpoint):
+            bonjourLiveNames.insert(name)
             guard
                 let idString = txt["id"],
                 let peerID = UInt64(idString),
@@ -334,14 +379,9 @@ final class PeerSnowNetwork {
                 let verString = txt["ver"],
                 let ver = UInt8(verString),
                 ver == Self.version
-            else { continue }
+            else { return }
 
-            seenIDs.insert(peerID)
             let side = resolvedSide(for: peerID)
-            // Pin the Bonjour endpoint to the discovered local interface so UDP
-            // stays on Wi‑Fi even when a VPN owns the default route.
-            let endpoint = NWEndpoint.service(name: name, type: type, domain: domain, interface: interface)
-
             if var existing = peers[peerID] {
                 existing.name = name
                 existing.token = token
@@ -349,7 +389,6 @@ final class PeerSnowNetwork {
                 existing.side = side
                 existing.lastSeen = CACurrentMediaTime()
                 peers[peerID] = existing
-                ensureConnection(for: peerID)
             } else {
                 peers[peerID] = PeerState(
                     id: peerID,
@@ -361,16 +400,20 @@ final class PeerSnowNetwork {
                     lastSeq: 0,
                     side: side
                 )
-                ensureConnection(for: peerID)
             }
-        }
+            ensureConnection(for: peerID)
+            emitPeersChanged()
 
-        let removed = peers.keys.filter { !seenIDs.contains($0) && (CACurrentMediaTime() - (peers[$0]?.lastSeen ?? 0)) > 12 }
-        for id in removed {
-            peers[id]?.connection?.cancel()
-            peers.removeValue(forKey: id)
+        case let .removed(name):
+            bonjourLiveNames.remove(name)
+            let gone = peers.filter { $0.value.name == name }.map(\.key)
+            guard !gone.isEmpty else { return }
+            for id in gone {
+                peers[id]?.connection?.cancel()
+                peers.removeValue(forKey: id)
+            }
+            emitPeersChanged()
         }
-        emitPeersChanged()
     }
 
     private func resolvedSide(for id: UInt64) -> PeerRelativeSide {
@@ -413,30 +456,58 @@ final class PeerSnowNetwork {
 
     // MARK: - Send / receive
 
+    /// Exactly one peer per throw edge.
     private func targets(for edge: SnowEdge) -> [PeerState] {
-        let live = peers.values.filter {
-            $0.endpoint != nil && (CACurrentMediaTime() - $0.lastSeen) < 12
-        }
-        if live.isEmpty { return [] }
-
-        let explicit = live.filter {
-            ($0.side == .left && edge == .left) || ($0.side == .right && edge == .right)
-        }
-        if !explicit.isEmpty { return Array(explicit) }
-
-        let autos = live.filter { $0.side == PeerRelativeSide.auto }
-        if autos.count == 1 { return autos }
-        if autos.count > 1 {
-            // Stable virtual desk: lower peer id sits on the left.
-            let sorted = autos.sorted { $0.id < $1.id }
-            if edge == .left {
-                return sorted.first.map { [$0] } ?? []
-            }
-            return sorted.last.map { [$0] } ?? []
+        if let peer = resolvedTarget(for: edge) {
+            return [peer]
         }
         return []
     }
 
+    private func livePeers() -> [PeerState] {
+        let now = CACurrentMediaTime()
+        return peers.values.filter { peer in
+            peer.endpoint != nil
+                && (bonjourLiveNames.contains(peer.name) || (now - peer.lastSeen) < 12)
+        }
+    }
+
+    private func resolvedTarget(for edge: SnowEdge) -> PeerState? {
+        let live = livePeers()
+        guard !live.isEmpty else { return nil }
+
+        let want: PeerRelativeSide = (edge == .left) ? .left : .right
+        // Explicit seat wins (uniqueness enforced in setSide).
+        if let seated = live.filter({ $0.side == want }).sorted(by: { $0.id < $1.id }).first {
+            return seated
+        }
+
+        let leftTaken = live.contains { $0.side == .left }
+        let rightTaken = live.contains { $0.side == .right }
+        let autos = live.filter { $0.side == .auto }.sorted { $0.id < $1.id }
+        guard !autos.isEmpty else { return nil }
+
+        // Single auto peer with no seats claimed → both edges hit them.
+        if autos.count == 1, !leftTaken, !rightTaken {
+            return autos[0]
+        }
+        if edge == .left, !leftTaken {
+            return autos.first
+        }
+        if edge == .right, !rightTaken {
+            return autos.count >= 2 ? autos.last : autos.first
+        }
+        return nil
+    }
+
+    private func currentThrowRoute() -> LanThrowRoute {
+        LanThrowRoute(
+            leftName: resolvedTarget(for: .left)?.name,
+            rightName: resolvedTarget(for: .right)?.name
+        )
+    }
+
+    @discardableResult
     private func send(
         type: UInt8,
         to peer: PeerState,
@@ -444,12 +515,15 @@ final class PeerSnowNetwork {
         normY: Float,
         vx: Float,
         vy: Float,
-        mass: Float
-    ) {
+        mass: Float,
+        seqOverride: UInt32? = nil
+    ) -> UInt32? {
         guard let connection = peers[peer.id]?.connection ?? {
             ensureConnection(for: peer.id)
             return peers[peer.id]?.connection
-        }() else { return }
+        }() else { return nil }
+
+        let seq = seqOverride ?? UInt32.random(in: 1...UInt32.max)
 
         // Layout (48 bytes): magic/ver/type/flags/id/seq/time/edge/pad/normY16/vx/vy/mass/hmac8
         var packet = Data(count: Self.packetSize)
@@ -460,7 +534,6 @@ final class PeerSnowNetwork {
             base[5] = type
             writeUInt16(0, to: base + 6)
             writeUInt64(localID, to: base + 8)
-            let seq = UInt32.random(in: 1...UInt32.max)
             writeUInt32(seq, to: base + 16)
             writeUInt32(UInt32(CACurrentMediaTime()), to: base + 20)
             base[24] = edge.rawValue
@@ -479,6 +552,7 @@ final class PeerSnowNetwork {
         packet.replaceSubrange(40..<48, with: tag)
 
         connection.send(content: packet, completion: .contentProcessed { _ in })
+        return seq
     }
 
     private func receiveLoop(on connection: NWConnection, expectedPeerID: UInt64?) {
@@ -517,13 +591,26 @@ final class PeerSnowNetwork {
         guard tag == expected else { return }
 
         let seq = readUInt32(bytes, 16)
-        // Replay window: allow wrap but reject exact repeats recently.
-        if seq == peer.lastSeq { return }
-        peer.lastSeq = seq
         peer.lastSeen = CACurrentMediaTime()
         if peer.connection == nil {
             peer.connection = connection
         }
+
+        // ACK echoes our outbound snowball seq — don't mix it into their replay window.
+        if type == Self.typeAck {
+            peers[senderID] = peer
+            if let pending = pendingThrows.removeValue(forKey: seq) {
+                let name = pending.peerName
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowDelivered?(name)
+                }
+            }
+            return
+        }
+
+        // Replay window for peer-originated traffic.
+        if seq == peer.lastSeq { return }
+        peer.lastSeq = seq
         peers[senderID] = peer
 
         switch type {
@@ -545,11 +632,23 @@ final class PeerSnowNetwork {
             let entry: SnowEdge = (leaveEdge == .left) ? .right : .left
             let inbound = InboundSnowball(
                 fromPeerID: senderID,
+                fromName: peer.name,
                 entryEdge: entry,
                 normY: normY,
                 vx: vx,
                 vy: vy,
                 mass: mass
+            )
+            // Confirm delivery so the thrower knows it landed.
+            _ = send(
+                type: Self.typeAck,
+                to: peer,
+                edge: leaveEdge,
+                normY: 0,
+                vx: 0,
+                vy: 0,
+                mass: 0,
+                seqOverride: seq
             )
             DispatchQueue.main.async { [weak self] in
                 self?.onInboundSnowball?(inbound)
@@ -593,52 +692,173 @@ final class PeerSnowNetwork {
 
     private func emitPeersChanged() {
         let snap = peerSnapshot
+        let route = currentThrowRoute()
+        let peersChanged = snap != lastEmittedPeers
+        lastEmittedPeers = snap
         DispatchQueue.main.async { [weak self] in
-            self?.onPeersChanged?(snap)
+            guard let self else { return }
+            self.throwRouteMain = route
+            if peersChanged {
+                self.onPeersChanged?(snap)
+            } else {
+                // Still refresh menu when only throw routing changed.
+                self.onPeersChanged?(snap)
+            }
         }
     }
 
     // MARK: - Local link (ignore VPN default route)
 
-    /// UDP path constrained to Wi‑Fi / Ethernet / Apple peer-to-peer, not utun VPN.
+    /// UDP path constrained away from cellular/loopback; LAN IPs keep Wi‑Fi route even with VPN.
     private static func localLinkUDPParameters() -> NWParameters {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
         params.includePeerToPeer = true
-        constrainToLocalLink(params)
-        return params
-    }
-
-    private static func localLinkBrowseParameters() -> NWParameters {
-        let params = NWParameters()
-        params.includePeerToPeer = true
-        constrainToLocalLink(params)
-        return params
-    }
-
-    private static func constrainToLocalLink(_ params: NWParameters) {
-        // Do not prohibit `.other`: AWDL (peer-to-peer Wi‑Fi) often reports as that.
-        // VPN tunnels are filtered by interface name when browsing (see isLocalLinkInterface).
         params.prohibitedInterfaceTypes = [.loopback, .cellular]
+        return params
+    }
+}
+
+// MARK: - Bonjour browse (NetService — TXT works; NWBrowser metadata is empty on macOS)
+
+private final class BonjourPeerBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+    enum Event {
+        case resolved(name: String, txt: [String: String], endpoint: NWEndpoint)
+        case removed(name: String)
     }
 
-    private static func isLocalLinkInterface(_ interface: NWInterface) -> Bool {
-        let name = interface.name.lowercased()
-        // Explicit VPN / tunnel device names — never use these for snowballs.
-        if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("ppp")
-            || name.hasPrefix("wg") || name.hasPrefix("tun") || name.hasPrefix("tap")
+    private let serviceType: String
+    private let onEvent: (Event) -> Void
+    private let browser = NetServiceBrowser()
+    private var resolving: [String: NetService] = [:]
+    private var liveNames = Set<String>()
+
+    init(serviceType: String, onEvent: @escaping (Event) -> Void) {
+        self.serviceType = serviceType.hasSuffix(".") ? serviceType : serviceType + "."
+        self.onEvent = onEvent
+        super.init()
+        browser.delegate = self
+        browser.includesPeerToPeer = true
+    }
+
+    func start() {
+        browser.searchForServices(ofType: serviceType, inDomain: "local.")
+    }
+
+    func stop() {
+        browser.stop()
+        for service in resolving.values {
+            service.stop()
+            service.delegate = nil
+        }
+        resolving.removeAll()
+        liveNames.removeAll()
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        let key = service.name
+        liveNames.insert(key)
+        service.delegate = self
+        resolving[key] = service
+        service.resolve(withTimeout: 5)
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
+        let key = service.name
+        liveNames.remove(key)
+        resolving[key]?.stop()
+        resolving[key]?.delegate = nil
+        resolving.removeValue(forKey: key)
+        onEvent(.removed(name: key))
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
+        NSLog("Flake: Bonjour browse failed: \(errorDict)")
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        let key = sender.name
+        defer {
+            sender.stop()
+            sender.delegate = nil
+            resolving.removeValue(forKey: key)
+        }
+        guard liveNames.contains(key) else { return }
+        guard let txtData = sender.txtRecordData() else { return }
+        let raw = NetService.dictionary(fromTXTRecord: txtData)
+        var txt: [String: String] = [:]
+        for (k, v) in raw {
+            if let s = String(data: v, encoding: .utf8) { txt[k] = s }
+        }
+        guard !txt.isEmpty else { return }
+        guard let endpoint = Self.endpoint(for: sender) else { return }
+        onEvent(.resolved(name: sender.name, txt: txt, endpoint: endpoint))
+    }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        resolving.removeValue(forKey: sender.name)
+        sender.delegate = nil
+        NSLog("Flake: Bonjour resolve failed for \(sender.name): \(errorDict)")
+    }
+
+    /// Prefer a LAN unicast address so UDP stays off the VPN tunnel.
+    private static func endpoint(for service: NetService) -> NWEndpoint? {
+        if let lan = firstLANHost(from: service.addresses),
+           let port = NWEndpoint.Port(rawValue: UInt16(service.port))
         {
-            return false
+            return NWEndpoint.hostPort(host: lan, port: port)
         }
-        switch interface.type {
-        case .wifi, .wiredEthernet:
-            return true
-        case .other:
-            // AWDL / LLW are fine; unknown virtual NICs are not.
-            return name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("en")
-        default:
-            return false
+        // Fallback: Bonjour service name (Network.framework re-resolves).
+        var type = service.type
+        if type.hasSuffix(".") { type.removeLast() }
+        var domain = service.domain
+        if domain.hasSuffix(".") { domain.removeLast() }
+        return NWEndpoint.service(name: service.name, type: type, domain: domain, interface: nil)
+    }
+
+    private static func firstLANHost(from addresses: [Data]?) -> NWEndpoint.Host? {
+        guard let addresses else { return nil }
+        var fallback: NWEndpoint.Host?
+        for data in addresses {
+            guard let ip = numericHost(fromSockaddr: data) else { continue }
+            if ip.contains(":") {
+                // IPv6 — keep as fallback only.
+                if fallback == nil { fallback = NWEndpoint.Host(ip) }
+                continue
+            }
+            let parts = ip.split(separator: ".").compactMap { UInt8($0) }
+            guard parts.count == 4 else { continue }
+            let o0 = parts[0], o1 = parts[1]
+            if o0 == 198 && (o1 == 18 || o1 == 19) { continue } // VPN fake-ip
+            if o0 == 127 { continue }
+            let isPrivate =
+                o0 == 10
+                || (o0 == 192 && o1 == 168)
+                || (o0 == 172 && o1 >= 16 && o1 <= 31)
+                || (o0 == 169 && o1 == 254)
+            let host = NWEndpoint.Host(ip)
+            if isPrivate { return host }
+            if fallback == nil { fallback = host }
         }
+        return fallback
+    }
+
+    private static func numericHost(fromSockaddr data: Data) -> String? {
+        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let rc = data.withUnsafeBytes { raw -> Int32 in
+            guard let sa = raw.baseAddress?.assumingMemoryBound(to: sockaddr.self) else { return -1 }
+            return getnameinfo(
+                sa,
+                socklen_t(data.count),
+                &hostname,
+                socklen_t(hostname.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+        }
+        guard rc == 0 else { return nil }
+        return String(cString: hostname)
     }
 }
 

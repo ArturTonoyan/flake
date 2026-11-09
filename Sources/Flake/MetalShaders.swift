@@ -45,10 +45,21 @@ enum MetalShaders {
         float2 pc [[point_coord]]
     ) {
         float2 d = pc - float2(0.5);
-        float r2 = dot(d, d);
-        if (r2 > 0.25) discard_fragment();
-        float soft = smoothstep(0.25, 0.02, r2);
-        return float4(1.0, 1.0, 1.0, soft * in.opacity);
+        float r = length(d) * 2.0;
+        if (r > 1.0) discard_fragment();
+
+        // Soft crystal: bright core + faint 6-fold arms + cool bloom.
+        float ang = atan2(d.y, d.x);
+        float spokes = pow(abs(cos(ang * 3.0)), 5.0);
+        float core = smoothstep(1.0, 0.18, r);
+        float arms = spokes * smoothstep(1.0, 0.28, r) * 0.48;
+        float bloom = exp(-r * r * 3.2) * 0.42;
+        float shape = clamp(core * 0.9 + arms + bloom, 0.0, 1.0);
+
+        float3 cool = float3(0.78, 0.88, 1.0);
+        float3 warm = float3(1.0, 1.0, 1.0);
+        float3 color = mix(cool, warm, core);
+        return float4(color, shape * in.opacity);
     }
 
     vertex FlakeOut ball_vertex(
@@ -100,6 +111,14 @@ enum MetalShaders {
                 color = float3(0.06, 0.06, 0.07);      // coal
             }
             return float4(color, edge);
+        }
+
+        // Peer snow stain / burst grit: flatter wet blotch (opacity kept below ~0.88).
+        if (in.opacity < 0.88) {
+            float wet = smoothstep(1.0, 0.15, r);
+            float3 color = mix(float3(0.78, 0.86, 0.95), float3(0.97, 0.99, 1.0), wet);
+            float alpha = wet * clamp(in.opacity, 0.0, 1.0);
+            return float4(color, alpha);
         }
 
         // Round soft snowball: cool shade at bottom, bright body, top-left highlight.

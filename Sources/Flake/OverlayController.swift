@@ -27,8 +27,12 @@ final class OverlayController {
     private var lastScreenSignature: String = ""
     private(set) var lanPeers: [PeerInfo] = []
     var onLanPeersChanged: (() -> Void)?
+    private let toast = LanToastBanner()
 
     var isPaused = false
+
+    /// Who currently receives a throw off each screen edge (for the menu).
+    var throwRoute: LanThrowRoute { peerNetwork.throwRouteMain }
     var intensity: Double = 0.7 {
         didSet { simulator.intensity = Float(intensity) }
     }
@@ -89,13 +93,22 @@ final class OverlayController {
         }
         peerNetwork.onInboundSnowball = { [weak self] ball in
             guard let self else { return }
+            let short = Self.shortPeerName(ball.fromName)
             _ = self.simulator.spawnInboundSnowball(
                 entryEdge: ball.entryEdge,
                 normY: ball.normY,
                 vx: ball.vx,
                 vy: ball.vy,
-                mass: ball.mass
+                mass: ball.mass,
+                fromName: short
             )
+            self.toast.show("Снежок от \(short)")
+        }
+        peerNetwork.onThrowDelivered = { [weak self] name in
+            self?.toast.show("Долетело → \(Self.shortPeerName(name))")
+        }
+        peerNetwork.onThrowMissed = { [weak self] name in
+            self?.toast.show("Не дошло до \(Self.shortPeerName(name))")
         }
         let saved = UserDefaults.standard.bool(forKey: PeerSnowNetwork.defaultsKeyEnabled)
         simulator.lanHandoffEnabled = saved
@@ -104,6 +117,32 @@ final class OverlayController {
 
     func setPeerSide(_ side: PeerRelativeSide, peerID: UInt64) {
         peerNetwork.setSide(side, forPeerID: peerID)
+    }
+
+    /// Local preview of the peer hit animation (fly → explode → stain).
+    func previewLanSnowballHit() {
+        lanSnowballsEnabled = true
+        let edge: SnowEdge = Bool.random() ? .left : .right
+        _ = simulator.spawnInboundSnowball(
+            entryEdge: edge,
+            normY: Float.random(in: 0.2...0.8),
+            vx: edge == .left ? 400 : -400,
+            vy: Float.random(in: -80...80),
+            mass: Float.random(in: 40...120),
+            fromName: "тест"
+        )
+        toast.show("Снежок от тест")
+    }
+
+    static func shortPeerName(_ name: String) -> String {
+        let separators = ["—", "–", "-"]
+        for sep in separators {
+            if let range = name.range(of: sep) {
+                let tail = name[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !tail.isEmpty { return tail }
+            }
+        }
+        return name
     }
 
     private func installMouseMonitors() {
@@ -175,7 +214,9 @@ final class OverlayController {
             )
             // Force the panel onto this exact display (multi-monitor critical).
             panel.setFrame(frame, display: true)
-            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)))
+            // Above Dock/windows so drifts sit on chrome, but below menu bar & pop-up
+            // menus (screenSaver level drew snow on top of the status-item settings).
+            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
@@ -307,13 +348,18 @@ final class OverlayController {
                     peerNetwork.sendSnowball(exit)
                 }
             }
+        } else {
+            // Peer hits still animate while local snow is paused.
+            simulator.tickLanImpacts(dt: dt)
         }
 
+        let hasLanHits = simulator.hasActiveLanImpacts
         for item in overlays {
-            // Maximized / fullscreen on this display → hide the whole overlay so flakes
-            // never flicker in the menu-bar strip or along the window edges.
+            // Maximized / fullscreen → hide regular snow, but keep the panel up for peer hits
+            // so the splat reads on top of (and "inside") any window / fullscreen app.
             let blocked = simulator.isSnowBlocked(screenFrame: item.renderer.screenFrame)
-            if blocked {
+            let showLan = hasLanHits && simulator.hasLanImpacts(in: item.renderer.screenFrame)
+            if blocked && !showLan {
                 if item.panel.alphaValue != 0 {
                     item.panel.alphaValue = 0
                 }
@@ -322,7 +368,17 @@ final class OverlayController {
             if item.panel.alphaValue != 1 {
                 item.panel.alphaValue = 1
             }
-            item.renderer.render(into: item.view)
+            // Lift above fullscreen apps while a hit is visible (still below the menu bar popovers).
+            let wantLevel = showLan
+                ? NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 1)
+                : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
+            if item.panel.level != wantLevel {
+                item.panel.level = wantLevel
+            }
+            if showLan || item.panel.isVisible {
+                item.panel.orderFrontRegardless()
+            }
+            item.renderer.render(into: item.view, lanOnly: blocked && showLan)
         }
     }
 }

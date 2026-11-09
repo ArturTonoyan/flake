@@ -33,6 +33,40 @@ struct Snowball {
     }
 }
 
+/// Peer snowball hit: flies in, bursts, leaves a fading stain over any window.
+private struct LanImpact {
+    enum Phase {
+        case flying
+        case exploding
+        case staining
+    }
+
+    struct BurstBit {
+        var x: Float
+        var y: Float
+        var vx: Float
+        var vy: Float
+        var size: Float
+        var life: Float
+        var maxLife: Float
+    }
+
+    var phase: Phase
+    var x: Float
+    var y: Float
+    var bx: Float
+    var by: Float
+    var bvx: Float
+    var bvy: Float
+    var radius: Float
+    var age: Float
+    var stainAge: Float
+    var stainLifetime: Float
+    var burst: [BurstBit]
+    var blotches: [(dx: Float, dy: Float, scale: Float)]
+    var fromName: String
+}
+
 /// Three stacked balls fused into a snowman.
 struct Snowman {
     var x: Float
@@ -331,6 +365,12 @@ final class SnowSimulator {
     private var formingMass: Float = 0
     private let ballSpawnThreshold: Float = 11
     private let ballMaxMass: Float = 180
+    /// Recent cursor velocity while holding — release-frame speed is often ~0 after a flick.
+    private var flickVX: Float = 0
+    private var flickVY: Float = 0
+    private var flickAge: Float = 0
+    /// Ball indices that must leave a ledge before soft re-settle (just thrown).
+    private var throwIgnoreSettle: Set<Int> = []
 
     private(set) var flakeUpload: [SIMD4<Float>] = []
     private(set) var ballUpload: [SIMD4<Float>] = []
@@ -340,6 +380,10 @@ final class SnowSimulator {
     private(set) var pendingEdgeExits: [OutboundSnowball] = []
     /// When false, edge exits melt locally instead of being offered to peers.
     var lanHandoffEnabled = false
+    /// Peer snowball impacts: fly → explode → stain. Drawn even over fullscreen apps.
+    private var lanImpacts: [LanImpact] = []
+    /// Always-on-top sprites for LAN impacts (ball + stain blotches + burst grit).
+    private(set) var lanOverlayUpload: [SIMD4<Float>] = []
     private(set) var driftVertices: [SIMD2<Float>] = []
     private(set) var driftColors: [SIMD4<Float>] = []
     private(set) var driftStripCounts: [Int] = []
@@ -458,6 +502,25 @@ final class SnowSimulator {
         }
     }
 
+    /// Peer impact animations that must stay visible over fullscreen / window content.
+    var hasActiveLanImpacts: Bool { !lanImpacts.isEmpty }
+
+    /// Keep LAN hit animations alive even while snowfall is paused.
+    func tickLanImpacts(dt: Float) {
+        updateLanImpacts(dt: min(dt, 1.0 / 20.0))
+    }
+
+    func hasLanImpacts(in screenFrame: NSRect) -> Bool {
+        let minX = Float(screenFrame.minX) - 40
+        let maxX = Float(screenFrame.maxX) + 40
+        let minY = Float(screenFrame.minY) - 40
+        let maxY = Float(screenFrame.maxY) + 40
+        return lanImpacts.contains { hit in
+            (hit.bx >= minX && hit.bx <= maxX && hit.by >= minY && hit.by <= maxY)
+                || (hit.x >= minX && hit.x <= maxX && hit.y >= minY && hit.y <= maxY)
+        }
+    }
+
     private func isOnBlockedScreen(x: Float, y: Float) -> Bool {
         // Resolve the owning display first. Screens stacked vertically share an edge;
         // a pad/overlap test would let a fullscreen upper monitor blank the lower one
@@ -500,40 +563,77 @@ final class SnowSimulator {
         return exits
     }
 
-    /// Spawn a snowball arriving from a peer across the matching screen edge.
+    /// Peer snowball: flies in from the entry edge to a random spot, explodes, leaves a stain.
     @discardableResult
     func spawnInboundSnowball(
         entryEdge: SnowEdge,
         normY: Float,
         vx: Float,
         vy: Float,
-        mass: Float
+        mass: Float,
+        fromName: String = ""
     ) -> Bool {
-        guard balls.count < maxBalls else { return false }
+        guard lanImpacts.count < 12 else { return false }
         let clampedMass = min(ballMaxMass, max(8, mass))
-        let r = max(6, min(36, 4.2 + sqrtf(clampedMass) * 1.65))
-        let y = worldMinY + min(1, max(0, normY)) * max(1, worldMaxY - worldMinY)
-        let x: Float
-        var inboundVX = vx
+        let radius = max(10, min(34, 5.5 + sqrtf(clampedMass) * 1.55))
+
+        // Prefer a random point on a random display (inset so the stain reads clearly).
+        let screen: (minX: Float, maxX: Float, minY: Float, maxY: Float, width: Float)
+        if let pick = screenRects.randomElement(using: &rng) {
+            screen = pick
+        } else {
+            screen = (worldMinX, worldMaxX, worldMinY, worldMaxY, max(1, worldMaxX - worldMinX))
+        }
+        let insetX: Float = 90
+        let insetY: Float = 80
+        let targetX = Float.random(
+            in: (screen.minX + insetX)...max(screen.minX + insetX + 1, screen.maxX - insetX),
+            using: &rng
+        )
+        let targetY = Float.random(
+            in: (screen.minY + insetY)...max(screen.minY + insetY + 1, screen.maxY - insetY),
+            using: &rng
+        )
+
+        // Start off-screen on the arrival edge, aimed at the random target.
+        let startX: Float
+        let startY = min(screen.maxY - 40, max(screen.minY + 40, targetY + Float.random(in: -120...120, using: &rng)))
         switch entryEdge {
         case .left:
-            x = worldMinX + r + 2
-            // Ensure it continues inward.
-            if inboundVX < 40 { inboundVX = max(180, abs(vx)) }
+            startX = screen.minX - radius - 8
         case .right:
-            x = worldMaxX - r - 2
-            if inboundVX > -40 { inboundVX = -max(180, abs(vx)) }
+            startX = screen.maxX + radius + 8
         }
-        balls.append(
-            Snowball(
-                x: x,
-                y: min(worldMaxY - r, max(worldMinY + r, y)),
-                vx: inboundVX,
-                vy: vy,
-                mass: clampedMass,
-                held: false,
-                stackedOn: nil,
-                restingLedge: nil
+        let dx = targetX - startX
+        let dy = targetY - startY
+        let dist = max(1, hypot(dx, dy))
+        let speed = max(980, min(1_600, hypot(vx, vy) * 1.8 + 1_050))
+        var blotches: [(dx: Float, dy: Float, scale: Float)] = [(0, 0, 1)]
+        for _ in 0..<Int.random(in: 5...8, using: &rng) {
+            blotches.append(
+                (
+                    dx: Float.random(in: -1.1...1.1, using: &rng) * radius,
+                    dy: Float.random(in: -0.85...0.85, using: &rng) * radius,
+                    scale: Float.random(in: 0.35...0.85, using: &rng)
+                )
+            )
+        }
+        lanImpacts.append(
+            LanImpact(
+                phase: .flying,
+                x: targetX,
+                y: targetY,
+                bx: startX,
+                by: startY,
+                bvx: dx / dist * speed,
+                bvy: dy / dist * speed,
+                radius: radius,
+                age: 0,
+                stainAge: 0,
+                stainLifetime: Float.random(in: 1.8...2.6, using: &rng),
+                burst: [],
+                blotches: blotches,
+                fromName: fromName
             )
         )
         return true
@@ -547,10 +647,16 @@ final class SnowSimulator {
         balls.removeAll(keepingCapacity: true)
         snowmen.removeAll(keepingCapacity: true)
         pendingEdgeExits.removeAll(keepingCapacity: true)
+        lanImpacts.removeAll(keepingCapacity: true)
+        lanOverlayUpload.removeAll(keepingCapacity: true)
         heldBallIndex = nil
         rollingBallIndex = nil
         heldSnowmanIndex = nil
         formingMass = 0
+        flickVX = 0
+        flickVY = 0
+        flickAge = 0
+        throwIgnoreSettle.removeAll(keepingCapacity: true)
         surfaceMissingSince.removeAll(keepingCapacity: true)
         restoreGuardUntil.removeAll(keepingCapacity: true)
         dumpCooldownUntil.removeAll(keepingCapacity: true)
@@ -586,14 +692,42 @@ final class SnowSimulator {
         spawn(dt: dtClamped)
         integrate(dt: dtClamped, ledges: liveLedges)
         if mouseEnabled {
+            sampleFlickVelocity(dt: dtClamped)
             handleMouseButtons()
             applyMouse(dt: dtClamped)
         }
         updateBalls(dt: dtClamped, ledges: liveLedges)
         updateSnowmen(dt: dtClamped, ledges: liveLedges)
+        updateLanImpacts(dt: dtClamped)
         wasMouseDown = mouseDown
         rememberWindowPoses()
         buildUploadBuffers()
+    }
+
+    /// Keep the strongest recent swipe so a throw still launches after the cursor stops.
+    private func sampleFlickVelocity(dt: Float) {
+        let holding = mouseDown && (heldBallIndex != nil || rollingBallIndex != nil || heldSnowmanIndex != nil)
+        guard holding else {
+            if !mouseDown {
+                flickAge += dt
+                if flickAge > 0.18 {
+                    flickVX = 0
+                    flickVY = 0
+                }
+            }
+            return
+        }
+        flickAge = 0
+        let speed = hypot(mouseVX, mouseVY)
+        let flickSpeed = hypot(flickVX, flickVY)
+        // Fresh fast samples win; otherwise decay slowly so a flick peak survives release.
+        if speed >= flickSpeed * 0.85 || speed > 140 {
+            flickVX = mouseVX
+            flickVY = mouseVY
+        } else {
+            flickVX *= 0.92
+            flickVY *= 0.92
+        }
     }
 
     private func rememberWindowPoses() {
@@ -802,7 +936,7 @@ final class SnowSimulator {
         }
     }
 
-    /// Turn scraped drift height into sand-like grains pouring off the ledge.
+    /// Scraped drift → loose snow clumps (not a sand jet).
     private func ejectScrapedSnow(
         surface: SettledSurface,
         localL: Float,
@@ -815,27 +949,36 @@ final class SnowSimulator {
         let ledge = surface.ledge
         let mid = (localL + localR) * 0.5
         let span = max(8, localR - localL)
-        let count = min(28, max(3, Int(amount / 1.2)))
-        let push = max(8, min(40, abs(winVX) * 0.12))
+        let count = min(16, max(2, Int(amount / 2.0)))
+        let push = max(10, min(46, abs(winVX) * 0.14))
         let dir: Float = winVX >= 0 ? 1 : -1
         _ = winVY
-        for _ in 0..<count {
-            guard particles.count < maxParticles else { return }
-            let lx = mid + Float.random(in: -span * 0.5...span * 0.5, using: &rng)
-            particles.append(
-                FlakeParticle(
-                    x: ledge.x + max(0, min(ledge.width, lx)),
-                    y: ledge.y + Float.random(in: 0.5...(max(2, peak) * 0.8), using: &rng),
-                    vx: dir * Float.random(in: 4...(push + 8), using: &rng)
-                        + Float.random(in: -6...6, using: &rng),
-                    vy: Float.random(in: -160...(-65), using: &rng),
-                    size: Float.random(in: 1.5...3.2, using: &rng),
-                    opacity: Float.random(in: 0.55...0.95, using: &rng),
-                    wobble: Float.random(in: 0.12...0.35, using: &rng),
-                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
-                    heavy: true
+        let clumps = min(4, max(1, (count + 1) / 2))
+        var left = count
+        for c in 0..<clumps {
+            let take = max(1, left / (clumps - c))
+            left -= take
+            let baseLX = mid + Float.random(in: -span * 0.4...span * 0.4, using: &rng)
+            let baseX = ledge.x + max(0, min(ledge.width, baseLX))
+            let baseY = ledge.y + Float.random(in: 0.5...(max(2, peak) * 0.55), using: &rng)
+            let baseVX = dir * Float.random(in: 6...(push + 6), using: &rng)
+            let baseVY = Float.random(in: -70...(-10), using: &rng)
+            for _ in 0..<take {
+                guard particles.count < maxParticles else { return }
+                particles.append(
+                    FlakeParticle(
+                        x: baseX + Float.random(in: -7...7, using: &rng),
+                        y: baseY + Float.random(in: -4...5, using: &rng),
+                        vx: baseVX + Float.random(in: -14...14, using: &rng),
+                        vy: baseVY + Float.random(in: -30...20, using: &rng),
+                        size: Float.random(in: 1.7...4.2, using: &rng),
+                        opacity: Float.random(in: 0.5...0.95, using: &rng),
+                        wobble: Float.random(in: 0.5...1.3, using: &rng),
+                        phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                        heavy: true
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -919,6 +1062,107 @@ final class SnowSimulator {
             restitution: restitution, friction: friction
         )
         return true
+    }
+
+    /// True when a snowball overlaps the solid window body (glass / sides / bottom).
+    /// Sitting on the top snow ledge does not count — that is a normal landing.
+    private func circleOverlapsWindowBody(
+        _ win: SnowWindow,
+        x: Float,
+        y: Float,
+        radius: Float
+    ) -> Bool {
+        let bodyTop = win.y - 1
+        // Fully above the chrome → ledge physics owns this ball.
+        if y - radius >= bodyTop { return false }
+
+        // Deep inside the window rectangle (typical: release in the middle).
+        if x >= win.x, x <= win.right, y < bodyTop, y >= win.bottom {
+            return true
+        }
+
+        let cx = min(max(x, win.x), win.right)
+        let cy = min(max(y, win.bottom), bodyTop)
+        let dx = x - cx
+        let dy = y - cy
+        let d2 = dx * dx + dy * dy
+        if d2 < 0.0001 { return true }
+        let d = sqrtf(d2)
+        guard d < radius else { return false }
+        // Mostly upward contact = resting on the top edge / drift, not a glass hit.
+        let ny = dy / d
+        return ny <= 0.55
+    }
+
+    /// Explode a thrown snowball against a window into falling snow grit.
+    private func shatterBallIntoSnow(ballIndex: Int, against win: SnowWindow) {
+        guard balls.indices.contains(ballIndex), balls[ballIndex].mass > 1 else { return }
+        let b = balls[ballIndex]
+        let mass = b.mass
+        let r = b.radius
+
+        // Push grit outward from the window face / impact point.
+        let midX = win.x + win.width * 0.5
+        let midY = (win.y + win.bottom) * 0.5
+        var nx = b.x - midX
+        var ny = b.y - midY
+        let nlen = hypot(nx, ny)
+        if nlen > 0.1 {
+            nx /= nlen
+            ny /= nlen
+        } else {
+            nx = b.vx >= 0 ? 1 : -1
+            ny = 0.15
+        }
+
+        let count = min(56, max(18, Int(mass * 0.45) + Int(r)))
+        for _ in 0..<count {
+            guard particles.count < maxParticles else { break }
+            let spread = Float.random(in: -0.85...0.85, using: &rng)
+            let ox = nx + -ny * spread
+            let oy = ny + nx * spread
+            let olen = max(0.2, hypot(ox, oy))
+            let speed = Float.random(in: 90...280, using: &rng)
+            particles.append(
+                FlakeParticle(
+                    x: b.x + Float.random(in: -r * 0.35...r * 0.35, using: &rng),
+                    y: b.y + Float.random(in: -r * 0.35...r * 0.35, using: &rng),
+                    vx: (ox / olen) * speed + b.vx * 0.2,
+                    vy: (oy / olen) * speed * 0.55 + b.vy * 0.15 + Float.random(in: -40...60, using: &rng),
+                    size: Float.random(in: 1.6...3.6, using: &rng),
+                    opacity: Float.random(in: 0.65...0.98, using: &rng),
+                    wobble: Float.random(in: 0.12...0.4, using: &rng),
+                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                    heavy: true
+                )
+            )
+        }
+
+        // Some of the snow sticks to the window top as a small pile.
+        if win.canAccumulate, var surface = surfaces[win.id] {
+            let corner = surface.cornerRadius
+            let local = max(corner + 2, min(win.width - corner - 2, b.x - win.x))
+            let add = max(4, min(16, 3 + sqrtf(mass) * 1.1))
+            surface.depositCollapsePile(atLocalX: local, addPeak: add, radius: max(16, min(42, r * 2.2)))
+            surfaces[win.id] = surface
+            activeSurfaceIDs.insert(win.id)
+            markDriftDirty()
+        } else {
+            emitSandCascade(
+                x: b.x,
+                fromY: b.y + r,
+                toY: b.y - r,
+                count: min(24, Int(mass * 0.2) + 6),
+                outward: max(10, r)
+            )
+        }
+
+        throwIgnoreSettle.remove(ballIndex)
+        balls[ballIndex].mass = 0
+        balls[ballIndex].vx = 0
+        balls[ballIndex].vy = 0
+        balls[ballIndex].restingLedge = nil
+        balls[ballIndex].stackedOn = nil
     }
 
     /// Circle vs window sides / bottom. Top is a snow ledge — no bounce from above.
@@ -1031,10 +1275,15 @@ final class SnowSimulator {
     private func updateWind(dt: Float) {
         windTimer -= dt
         if windTimer <= 0 {
-            windTarget = Float.random(in: -18...18, using: &rng)
-            windTimer = Float.random(in: 2.5...6.0, using: &rng)
+            // Mostly gentle breeze, occasional stronger gust.
+            var next = Float.random(in: -22...22, using: &rng)
+            if Float.random(in: 0...1, using: &rng) < 0.18 {
+                next *= Float.random(in: 1.5...2.2, using: &rng)
+            }
+            windTarget = next
+            windTimer = Float.random(in: 1.6...5.5, using: &rng)
         }
-        wind += (windTarget - wind) * min(1, dt * 0.4)
+        wind += (windTarget - wind) * min(1, dt * 0.55)
     }
 
     private func syncSurfaces(with ledges: [SnowLedge]) {
@@ -1275,17 +1524,28 @@ final class SnowSimulator {
                 if neighborAbove {
                     y = screen.maxY - Float.random(in: 1...14, using: &rng)
                 } else {
-                    y = screen.maxY + Float.random(in: 4...48, using: &rng)
+                    y = screen.maxY + Float.random(in: 4...56, using: &rng)
                 }
+                // Many tiny distant flakes, fewer large nearby ones.
+                let u = Float.random(in: 0...1, using: &rng)
+                let size = 1.15 + powf(u, 2.15) * 4.6
+                let mass = max(0.35, size / 3.4)
+                let wobble = Float.random(in: 0.65...2.15, using: &rng) / sqrtf(mass)
+                let fall = -(32 + mass * 48) * Float.random(in: 0.82...1.18, using: &rng)
+                    * (0.78 + 0.32 * intensity)
+                let opacity = min(
+                    0.98,
+                    Float.random(in: 0.42...0.78, using: &rng) + (1.15 - min(1.15, mass)) * 0.18
+                )
                 particles.append(
                     FlakeParticle(
                         x: x,
                         y: y,
-                        vx: wind * 0.15 + Float.random(in: -12...12, using: &rng),
-                        vy: Float.random(in: -110...(-50), using: &rng) * (0.75 + 0.35 * intensity),
-                        size: Float.random(in: 1.6...4.4, using: &rng),
-                        opacity: Float.random(in: 0.55...1.0, using: &rng),
-                        wobble: Float.random(in: 0.5...1.8, using: &rng),
+                        vx: wind * (0.2 + 0.25 / mass) + Float.random(in: -16...16, using: &rng),
+                        vy: fall,
+                        size: size,
+                        opacity: opacity,
+                        wobble: wobble,
                         phase: Float.random(in: 0...(2 * .pi), using: &rng)
                     )
                 )
@@ -1303,18 +1563,30 @@ final class SnowSimulator {
 
         for i in particles.indices {
             var p = particles[i]
-            p.phase += dt * 2.2
             if p.heavy {
-                // Sand / grit: kill sideways drift fast, fall hard.
-                p.vx *= max(0, 1 - 5.5 * dt)
-                p.x += p.vx * dt
+                // Falling snow clumps: keep some sideways flutter so they don't look like a water jet.
+                let fluff = min(1.4, max(0.2, p.wobble))
+                p.phase += dt * (1.8 + fluff)
+                p.vx *= max(0, 1 - (2.4 + 2.2 * (1.2 - min(1.2, fluff))) * dt)
+                p.x += (p.vx + sinf(p.phase) * 9 * fluff) * dt
                 p.y += p.vy * dt
-                p.vy -= 380 * dt
+                // Heavier (low wobble) drops faster; fluffier chunks drift down.
+                p.vy -= (200 + 140 * (1.3 - min(1.3, fluff))) * dt
             } else {
-                p.vx += (wind - p.vx) * dt * 0.15
-                p.x += (p.vx + sinf(p.phase) * 14 * p.wobble) * dt
-                p.y += p.vy * dt
-                p.vy -= 18 * dt
+                // Size-aware flutter: big flakes fall straighter/faster, tiny ones drift.
+                let mass = max(0.35, min(1.7, p.size / 3.4))
+                let flutter = max(0.35, p.wobble)
+                p.phase += dt * (1.5 + flutter * 1.7 + (2.0 - mass) * 0.6)
+                let terminal = -(26 + mass * 58)
+                p.vy += (terminal - p.vy) * dt * (0.28 + 0.22 * mass)
+                let windCatch = 0.1 + 0.28 / mass
+                p.vx += (wind * (0.65 + 0.55 / mass) - p.vx) * dt * windCatch
+                let sway =
+                    sinf(p.phase) * 12 * flutter
+                    + sinf(p.phase * 2.31 + 0.7) * 5.5 * flutter
+                let bob = cosf(p.phase * 1.63) * (4.2 * flutter / mass)
+                p.x += (p.vx + sway) * dt
+                p.y += (p.vy + bob) * dt
             }
 
             // Cheap rejects before window tests.
@@ -1468,6 +1740,9 @@ final class SnowSimulator {
         let released = !mouseDown && wasMouseDown
 
         if pressed {
+            flickVX = 0
+            flickVY = 0
+            flickAge = 0
             if let sIdx = nearestSnowman(atX: mouseX, y: mouseY, maxDist: 40) {
                 snowmen[sIdx].held = true
                 snowmen[sIdx].restingLedge = nil
@@ -1484,6 +1759,7 @@ final class SnowSimulator {
                 heldBallIndex = idx
                 rollingBallIndex = idx
                 heldSnowmanIndex = nil
+                throwIgnoreSettle.remove(idx)
             }
         }
 
@@ -1509,11 +1785,33 @@ final class SnowSimulator {
     }
 
     private func releaseGrabbedBall() {
+        // Prefer the recent flick peak — release-frame mouseVX/VY is often near zero.
+        let releaseVX: Float
+        let releaseVY: Float
+        if hypot(flickVX, flickVY) > hypot(mouseVX, mouseVY) {
+            releaseVX = flickVX
+            releaseVY = flickVY
+        } else {
+            releaseVX = mouseVX
+            releaseVY = mouseVY
+        }
+
         if let sIdx = heldSnowmanIndex, snowmen.indices.contains(sIdx) {
             snowmen[sIdx].held = false
             snowmen[sIdx].restingLedge = nil
-            snowmen[sIdx].vx = mouseVX * 0.55
-            snowmen[sIdx].vy = mouseVY * 0.45
+            var tvx = releaseVX * 0.85
+            var tvy = releaseVY * 0.75
+            let speed = hypot(tvx, tvy)
+            if speed > 60, speed < 260 {
+                let boost = 260 / max(speed, 1)
+                tvx *= boost
+                tvy *= boost
+            }
+            snowmen[sIdx].vx = tvx
+            snowmen[sIdx].vy = tvy
+            if speed > 60 {
+                snowmen[sIdx].y += max(8, snowmen[sIdx].baseR * 0.4)
+            }
         }
         heldSnowmanIndex = nil
 
@@ -1522,18 +1820,23 @@ final class SnowSimulator {
             balls[idx].held = false
             balls[idx].stackedOn = nil
             balls[idx].restingLedge = nil
-            // Fling with cursor velocity — allow upward throws.
-            let throwVX = mouseVX * 0.7
-            let throwVY = mouseVY * 0.65
+            // Fling with flick velocity — allow upward / sideways throws.
+            var throwVX = releaseVX * 0.95
+            var throwVY = releaseVY * 0.9
             let speed = hypot(throwVX, throwVY)
             balls[idx].vx = throwVX
             balls[idx].vy = throwVY
-            // Boost weak flicks so a quick swipe always launches.
-            if speed > 80, speed < 220 {
-                let boost = 220 / max(speed, 1)
-                balls[idx].vx *= boost
-                balls[idx].vy *= boost
-            } else if speed <= 80 {
+            if speed > 55, speed < 280 {
+                // Boost weak flicks so a quick swipe always launches.
+                let boost = 280 / max(speed, 1)
+                throwVX *= boost
+                throwVY *= boost
+                balls[idx].vx = throwVX
+                balls[idx].vy = throwVY
+                // Lift off the pile so the same-frame land catch doesn't eat the throw.
+                balls[idx].y += max(6, balls[idx].radius * 0.35)
+                throwIgnoreSettle.insert(idx)
+            } else if speed <= 55 {
                 // Slow drop: try stacking / settling instead of a toss.
                 balls[idx].vx = throwVX
                 balls[idx].vy = min(0, throwVY)
@@ -1542,12 +1845,17 @@ final class SnowSimulator {
                 if snowmen.count == snowmenBefore, balls.indices.contains(idx), balls[idx].stackedOn == nil {
                     settleBallOnLedgeIfNeeded(idx)
                 }
+            } else {
+                balls[idx].y += max(6, balls[idx].radius * 0.35)
+                throwIgnoreSettle.insert(idx)
             }
-            // Fast throw: leave airborne — no immediate settle.
         }
         heldBallIndex = nil
         rollingBallIndex = nil
         formingMass = 0
+        flickVX = 0
+        flickVY = 0
+        flickAge = 0
     }
 
     /// Soft point sprites fade before the full radius — nest into the pile so the
@@ -1716,7 +2024,7 @@ final class SnowSimulator {
         return best
     }
 
-    /// Dense particles that pour downward (edge spill / snowman collapse).
+    /// Soft snow clumps falling apart (edge spill / snowman collapse) — not a water column.
     private func emitSandCascade(
         x: Float,
         fromY: Float,
@@ -1726,21 +2034,31 @@ final class SnowSimulator {
     ) {
         let top = max(fromY, toY)
         let bot = min(fromY, toY)
-        for _ in 0..<count {
-            guard particles.count < maxParticles else { return }
-            particles.append(
-                FlakeParticle(
-                    x: x + Float.random(in: -outward...outward, using: &rng),
-                    y: Float.random(in: bot...max(bot + 1, top), using: &rng),
-                    vx: Float.random(in: -outward * 0.35...outward * 0.35, using: &rng),
-                    vy: Float.random(in: -160...(-55), using: &rng),
-                    size: Float.random(in: 1.5...3.2, using: &rng),
-                    opacity: Float.random(in: 0.6...0.95, using: &rng),
-                    wobble: Float.random(in: 0.15...0.35, using: &rng),
-                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
-                    heavy: true
+        let clumps = min(5, max(1, (count + 2) / 3))
+        var left = count
+        for c in 0..<clumps {
+            let take = max(1, left / (clumps - c))
+            left -= take
+            let baseX = x + Float.random(in: -outward * 0.55...outward * 0.55, using: &rng)
+            let baseY = Float.random(in: bot...max(bot + 1, top), using: &rng)
+            let baseVX = Float.random(in: -outward * 0.5...outward * 0.5, using: &rng)
+            let baseVY = Float.random(in: -70...(-12), using: &rng)
+            for _ in 0..<take {
+                guard particles.count < maxParticles else { return }
+                particles.append(
+                    FlakeParticle(
+                        x: baseX + Float.random(in: -5...5, using: &rng),
+                        y: baseY + Float.random(in: -4...4, using: &rng),
+                        vx: baseVX + Float.random(in: -12...12, using: &rng),
+                        vy: baseVY + Float.random(in: -25...18, using: &rng),
+                        size: Float.random(in: 1.6...4.0, using: &rng),
+                        opacity: Float.random(in: 0.55...0.95, using: &rng),
+                        wobble: Float.random(in: 0.5...1.3, using: &rng),
+                        phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                        heavy: true
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -1946,25 +2264,36 @@ final class SnowSimulator {
     }
 
     private func applyMouse(dt: Float) {
-        let flakeRadius: Float = 36
+        let flakeRadius: Float = 92
         let flakeRadius2 = flakeRadius * flakeRadius
         let speed = hypot(mouseVX, mouseVY)
         rollCooldown = max(0, rollCooldown - dt)
 
+        // Cursor wake: push + drag flakes along the pointer path.
+        let wake = min(1, dt * 55)
         for i in particles.indices {
+            if particles[i].heavy { continue }
             guard !isOccluded(x: particles[i].x, y: particles[i].y) else { continue }
             let dx = particles[i].x - mouseX
             let dy = particles[i].y - mouseY
             let d2 = dx * dx + dy * dy
             guard d2 < flakeRadius2, d2 > 0.01 else { continue }
             let d = sqrtf(d2)
+            let falloff = 1 - d / flakeRadius
+            let soft = falloff * falloff
             let nx = dx / d
             let ny = dy / d
-            let push = (1 - d / flakeRadius) * (38 + min(120, speed * 0.35))
-            particles[i].vx += nx * push * 0.08
-            particles[i].vy += ny * push * 0.08
-            if speed > 40 {
-                particles[i].vy += 12 * (1 - d / flakeRadius)
+            // Light flakes (small size) get thrown harder.
+            let lightness = max(0.55, min(1.45, 3.6 / max(1.2, particles[i].size)))
+            let push = soft * (55 + min(280, speed * 0.85)) * lightness
+            particles[i].vx += nx * push * wake
+            particles[i].vy += ny * push * wake
+            // Carry cursor momentum so a swipe leaves a visible trail of flakes.
+            let drag = soft * min(0.55, 0.12 + speed * 0.0011) * lightness
+            particles[i].vx += mouseVX * drag * wake
+            particles[i].vy += mouseVY * drag * wake
+            if speed > 25 {
+                particles[i].vy += soft * min(90, 18 + speed * 0.22) * wake
             }
         }
 
@@ -2197,6 +2526,13 @@ final class SnowSimulator {
 
             let flightSpeed = hypot(balls[i].vx, balls[i].vy)
             let inFlight = flightSpeed > 90
+            let justThrown = throwIgnoreSettle.contains(i)
+            // Horizontal throws start near the pile — don't soft-stick until they leave.
+            if justThrown, inFlight || abs(balls[i].vx) > 70 || balls[i].vy > 40 {
+                // Still carrying the throw — keep ignore flag.
+            } else if justThrown {
+                throwIgnoreSettle.remove(i)
+            }
 
             // Resting ball sticks to a still ledge — never ride a window being dragged.
             if let lid = balls[i].restingLedge, let ledge = ledgeByID[lid] {
@@ -2205,7 +2541,7 @@ final class SnowSimulator {
                     balls[i].restingLedge = nil
                 } else {
                     let onLedge = balls[i].x >= ledge.x - 2 && balls[i].x <= ledge.x + ledge.width + 2
-                    if onLedge && !inFlight {
+                    if onLedge && !inFlight && !justThrown {
                         balls[i].x = max(ledge.x + 3, min(ledge.x + ledge.width - 3, balls[i].x + balls[i].vx * dt))
                         let local2 = max(0, min(ledge.width, balls[i].x - ledge.x))
                         let pile2 = surfaces[lid]?.height(atLocalX: local2) ?? 0
@@ -2226,7 +2562,7 @@ final class SnowSimulator {
             }
 
             balls[i].vy -= 520 * dt
-            balls[i].vx *= inFlight ? 0.995 : (supportsStack ? 0.92 : 0.985)
+            balls[i].vx *= inFlight || justThrown ? 0.997 : (supportsStack ? 0.92 : 0.985)
             let steps = 4
             let stepDt = dt / Float(steps)
             var rested = false
@@ -2255,12 +2591,15 @@ final class SnowSimulator {
                     let ground = ballGroundY(ledgeY: ledge.y, pile: pile, radius: r)
                     // Still rising hard past the seat — let it arc over.
                     if balls[i].vy > 50, balls[i].y > ground + r * 0.5 { continue }
-                    // Tunnel-proof catch: any descent that crosses / overlaps the seat.
+                    // Tunnel-proof catch: any descent that crosses the seat.
                     let catchPad = max(8, abs(balls[i].vy) * stepDt + r * 0.35)
                     let crossed = balls[i].vy <= 20
                         && yBefore >= ground - 2
                         && balls[i].y <= ground + catchPad
-                    let overlapping = balls[i].vy <= 40
+                    // Soft overlap catch — skip while a throw is still leaving the ledge.
+                    let allowSoftLand = !justThrown && !inFlight && abs(balls[i].vx) < 110
+                    let overlapping = allowSoftLand
+                        && balls[i].vy <= 40
                         && balls[i].y <= ground + max(10, r * 1.1)
                         && balls[i].y >= ground - max(10, r * 0.95)
                     if crossed || overlapping {
@@ -2269,42 +2608,26 @@ final class SnowSimulator {
                         balls[i].vx *= supportsStack ? 0.5 : 0.82
                         if supportsStack || abs(balls[i].vx) < 12 { balls[i].vx = 0 }
                         balls[i].restingLedge = ledge.id
+                        throwIgnoreSettle.remove(i)
                         rested = true
                         break
                     }
                 }
                 if rested { break }
 
-                // Sides / bottom / face of windows — bounce like a wall.
-                var bounced = false
+                // Contact with window glass / sides / bottom → always shatter into snow.
+                // (Bouncing parked the ball on the top edge and looked broken when
+                // releasing a snowball in the middle of a window.)
+                var shattered = false
                 for win in bodyOccluders {
-                    let (wvx, wvy) = windowVelocity(for: win.id, current: win, dt: dt)
-                    var x = balls[i].x
-                    var y = balls[i].y
-                    var vx = balls[i].vx
-                    var vy = balls[i].vy
-                    if bounceCircleOffWindow(
-                        win,
-                        x: &x,
-                        y: &y,
-                        vx: &vx,
-                        vy: &vy,
-                        radius: r,
-                        winVX: wvx,
-                        winVY: wvy,
-                        restitution: 0.58,
-                        friction: 0.22
-                    ) {
-                        balls[i].x = x
-                        balls[i].y = y
-                        balls[i].vx = vx
-                        balls[i].vy = vy
-                        balls[i].restingLedge = nil
-                        bounced = true
+                    if circleOverlapsWindowBody(win, x: balls[i].x, y: balls[i].y, radius: r) {
+                        shatterBallIntoSnow(ballIndex: i, against: win)
+                        shattered = true
+                        rested = true
                         break
                     }
                 }
-                if bounced { continue }
+                if shattered { break }
 
                 // Smash a snowman if this snowball is flying fast enough.
                 if stepSpeed > 100, smashSnowmanIfHit(byBall: i) {
@@ -2412,6 +2735,15 @@ final class SnowSimulator {
         }
         if let r = rollingBallIndex {
             rollingBallIndex = (r < map.count) ? map[r] : nil
+        }
+        if !throwIgnoreSettle.isEmpty {
+            var remapped: Set<Int> = []
+            for old in throwIgnoreSettle {
+                if old < map.count, let neu = map[old] {
+                    remapped.insert(neu)
+                }
+            }
+            throwIgnoreSettle = remapped
         }
         balls = next
     }
@@ -2535,29 +2867,153 @@ final class SnowSimulator {
     }
 
     private func spillOffEdge(surface: SettledSurface, amount: Float, side: Float, outwardSpeed: Float) {
-        guard amount > 0.15 else { return }
+        guard amount > 0.18 else { return }
         let ledge = surface.ledge
-        // Just past the rounded corner, then pour straight down.
-        let edgeX = side < 0 ? ledge.x - 1.5 : ledge.x + ledge.width + 1.5
-        let n = min(18, Int(amount * 1.6) + 1)
-        // outwardSpeed only decides how many grains — not a balloon kick.
-        _ = outwardSpeed
-        for _ in 0..<n where particles.count < maxParticles {
-            let h = surface.height(atLocalX: side < 0 ? 0 : ledge.width)
-            particles.append(
-                FlakeParticle(
-                    x: edgeX + side * Float.random(in: 0...3, using: &rng),
-                    y: ledge.y + Float.random(in: 0...(max(2, h) * 0.7), using: &rng),
-                    vx: side * Float.random(in: 4...16, using: &rng)
-                        + Float.random(in: -4...4, using: &rng),
-                    vy: Float.random(in: -170...(-70), using: &rng),
-                    size: Float.random(in: 1.4...3.1, using: &rng),
-                    opacity: Float.random(in: 0.55...0.95, using: &rng),
-                    wobble: Float.random(in: 0.12...0.35, using: &rng),
-                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
-                    heavy: true
+        let edgeX = side < 0 ? ledge.x - 2 : ledge.x + ledge.width + 2
+        let h = surface.height(atLocalX: side < 0 ? 0 : ledge.width)
+        // Fewer flakes, in loose clumps — not a continuous faucet stream.
+        let boost = min(1.4, 0.7 + outwardSpeed / 220)
+        let n = min(11, max(2, Int(amount * 0.55 * boost) + 1))
+        let clumps = min(4, max(1, (n + 1) / 2))
+        var left = n
+        for c in 0..<clumps {
+            let take = max(1, left / (clumps - c))
+            left -= take
+            // Shared clump motion so it reads as a soft snow chunk breaking off.
+            let baseX = edgeX + side * Float.random(in: 0...8, using: &rng)
+            let baseY = ledge.y + Float.random(in: 0...(max(1.5, h) * 0.5), using: &rng)
+            let baseVX = side * Float.random(in: 10...36, using: &rng)
+                + Float.random(in: -12...12, using: &rng)
+            // Start almost hanging, then gravity takes over — no instant vertical jet.
+            let baseVY = Float.random(in: -48...(-6), using: &rng)
+            for _ in 0..<take {
+                guard particles.count < maxParticles else { return }
+                particles.append(
+                    FlakeParticle(
+                        x: baseX + Float.random(in: -6...6, using: &rng),
+                        y: baseY + Float.random(in: -4...5, using: &rng),
+                        vx: baseVX + Float.random(in: -16...16, using: &rng),
+                        vy: baseVY + Float.random(in: -28...18, using: &rng),
+                        size: Float.random(in: 1.7...4.4, using: &rng),
+                        opacity: Float.random(in: 0.5...0.95, using: &rng),
+                        wobble: Float.random(in: 0.55...1.35, using: &rng),
+                        phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                        heavy: true
+                    )
+                )
+            }
+        }
+    }
+
+    private func updateLanImpacts(dt: Float) {
+        guard !lanImpacts.isEmpty else {
+            lanOverlayUpload.removeAll(keepingCapacity: true)
+            return
+        }
+        var next: [LanImpact] = []
+        next.reserveCapacity(lanImpacts.count)
+        for var hit in lanImpacts {
+            hit.age += dt
+            switch hit.phase {
+            case .flying:
+                hit.bx += hit.bvx * dt
+                hit.by += hit.bvy * dt
+                let dx = hit.x - hit.bx
+                let dy = hit.y - hit.by
+                let dist = hypot(dx, dy)
+                let step = hypot(hit.bvx, hit.bvy) * dt
+                if dist <= max(14, step + hit.radius * 0.35) || hit.age > 1.4 {
+                    hit.bx = hit.x
+                    hit.by = hit.y
+                    hit.phase = .exploding
+                    hit.age = 0
+                    hit.burst = makeLanBurst(atX: hit.x, y: hit.y, radius: hit.radius)
+                }
+            case .exploding:
+                integrateLanBurst(&hit.burst, dt: dt)
+                if hit.age > 0.18 {
+                    hit.phase = .staining
+                    hit.stainAge = 0
+                }
+            case .staining:
+                hit.stainAge += dt
+                integrateLanBurst(&hit.burst, dt: dt)
+                if hit.stainAge >= hit.stainLifetime {
+                    continue
+                }
+            }
+            next.append(hit)
+        }
+        lanImpacts = next
+        rebuildLanOverlayUpload()
+    }
+
+    private func makeLanBurst(atX x: Float, y: Float, radius: Float) -> [LanImpact.BurstBit] {
+        let count = Int.random(in: 22...34, using: &rng)
+        var bits: [LanImpact.BurstBit] = []
+        bits.reserveCapacity(count)
+        for _ in 0..<count {
+            let angle = Float.random(in: 0...(2 * .pi), using: &rng)
+            let speed = Float.random(in: 180...520, using: &rng) * (0.65 + radius / 40)
+            bits.append(
+                LanImpact.BurstBit(
+                    x: x + Float.random(in: -radius * 0.2...radius * 0.2, using: &rng),
+                    y: y + Float.random(in: -radius * 0.2...radius * 0.2, using: &rng),
+                    vx: cosf(angle) * speed,
+                    vy: sinf(angle) * speed + Float.random(in: 40...160, using: &rng),
+                    size: Float.random(in: 2.2...5.5, using: &rng),
+                    life: 0,
+                    maxLife: Float.random(in: 0.35...0.75, using: &rng)
                 )
             )
+        }
+        return bits
+    }
+
+    private func integrateLanBurst(_ burst: inout [LanImpact.BurstBit], dt: Float) {
+        var alive: [LanImpact.BurstBit] = []
+        alive.reserveCapacity(burst.count)
+        for var bit in burst {
+            bit.life += dt
+            guard bit.life < bit.maxLife else { continue }
+            bit.vy -= 780 * dt
+            bit.vx *= max(0, 1 - 1.6 * dt)
+            bit.x += bit.vx * dt
+            bit.y += bit.vy * dt
+            alive.append(bit)
+        }
+        burst = alive
+    }
+
+    private func rebuildLanOverlayUpload() {
+        lanOverlayUpload.removeAll(keepingCapacity: true)
+        lanOverlayUpload.reserveCapacity(lanImpacts.count * 12)
+        for hit in lanImpacts {
+            switch hit.phase {
+            case .flying:
+                lanOverlayUpload.append(SIMD4(hit.bx, hit.by, hit.radius * 2.0, 1.0))
+            case .exploding:
+                // Shrinking flash of the ball + expanding soft shock.
+                let t = min(1, hit.age / 0.18)
+                let flash = hit.radius * 2.0 * (1.2 - t * 0.55)
+                // Keep opacity ≥ 0.89 so the ball uses solid snow shading, not stain.
+                lanOverlayUpload.append(SIMD4(hit.x, hit.y, flash, max(0.89, 1 - t * 0.4)))
+                lanOverlayUpload.append(SIMD4(hit.x, hit.y, hit.radius * (2.8 + t * 4.0), 0.55 * (1 - t)))
+            case .staining:
+                let fade = max(0, 1 - hit.stainAge / hit.stainLifetime)
+                // Soft irregular snow stain — several overlapping blotches.
+                let stainAlpha = 0.82 * powf(fade, 1.35)
+                for blotch in hit.blotches {
+                    let diam = hit.radius * 2.8 * blotch.scale
+                    lanOverlayUpload.append(
+                        SIMD4(hit.x + blotch.dx, hit.y + blotch.dy, diam, min(0.87, stainAlpha * (0.6 + 0.4 * blotch.scale)))
+                    )
+                }
+            }
+            for bit in hit.burst {
+                let fade = max(0, 1 - bit.life / bit.maxLife)
+                lanOverlayUpload.append(SIMD4(bit.x, bit.y, bit.size * 2.4, min(0.95, 0.95 * fade)))
+            }
         }
     }
 

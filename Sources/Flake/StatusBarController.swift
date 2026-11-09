@@ -134,8 +134,28 @@ final class StatusBarController {
             header.isEnabled = false
             sub.addItem(header)
 
+            let route = overlay.throwRoute
+            let leftLabel = route.leftName.map { "← влево: \(OverlayController.shortPeerName($0))" }
+                ?? "← влево: никого"
+            let rightLabel = route.rightName.map { "вправо: \(OverlayController.shortPeerName($0)) →" }
+                ?? "вправо: никого →"
+            let leftItem = NSMenuItem(title: leftLabel, action: nil, keyEquivalent: "")
+            leftItem.isEnabled = false
+            sub.addItem(leftItem)
+            let rightItem = NSMenuItem(title: rightLabel, action: nil, keyEquivalent: "")
+            rightItem.isEnabled = false
+            sub.addItem(rightItem)
+            sub.addItem(.separator())
+
             for peer in peers {
-                let peerItem = NSMenuItem(title: peer.name, action: nil, keyEquivalent: "")
+                let sideTag: String
+                switch peer.side {
+                case .left: sideTag = "слева"
+                case .right: sideTag = "справа"
+                case .auto: sideTag = "авто"
+                }
+                let short = OverlayController.shortPeerName(peer.name)
+                let peerItem = NSMenuItem(title: "\(short) · \(sideTag)", action: nil, keyEquivalent: "")
                 let peerMenu = NSMenu()
 
                 let status = NSMenuItem(title: "Подключён", action: nil, keyEquivalent: "")
@@ -144,7 +164,7 @@ final class StatusBarController {
                 peerMenu.addItem(status)
                 peerMenu.addItem(.separator())
 
-                let sideHeader = NSMenuItem(title: "Сторона экрана", action: nil, keyEquivalent: "")
+                let sideHeader = NSMenuItem(title: "Где он относительно тебя", action: nil, keyEquivalent: "")
                 sideHeader.isEnabled = false
                 peerMenu.addItem(sideHeader)
 
@@ -165,12 +185,20 @@ final class StatusBarController {
             }
 
             let hint = NSMenuItem(
-                title: "Бросок за левый/правый край → к ним",
+                title: "Одна сторона = один человек",
                 action: nil,
                 keyEquivalent: ""
             )
             hint.isEnabled = false
             sub.addItem(hint)
+
+            let preview = NSMenuItem(
+                title: "Тест прилёта на этот Mac",
+                action: #selector(previewLanHit),
+                keyEquivalent: ""
+            )
+            preview.target = self
+            sub.addItem(preview)
         }
 
         root.submenu = sub
@@ -200,6 +228,10 @@ final class StatusBarController {
     @objc private func toggleLan() {
         overlay.lanSnowballsEnabled.toggle()
         refreshMenu()
+    }
+
+    @objc private func previewLanHit() {
+        overlay.previewLanSnowballHit()
     }
 
     @objc private func setPeerSide(_ sender: NSMenuItem) {

@@ -23,6 +23,7 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
     private var flakeBuffer: MTLBuffer?
     private var ballBuffer: MTLBuffer?
     private var decorBuffer: MTLBuffer?
+    private var lanBuffer: MTLBuffer?
     private var driftPosBuffer: MTLBuffer?
     private var driftColBuffer: MTLBuffer?
     private var propPosBuffer: MTLBuffer?
@@ -131,7 +132,7 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         render(into: view)
     }
 
-    func render(into view: MTKView) {
+    func render(into view: MTKView, lanOnly: Bool = false) {
         guard
             let drawable = view.currentDrawable,
             let rpd = view.currentRenderPassDescriptor,
@@ -155,70 +156,81 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         let minY = Float(screenFrame.minY) - 40
         let maxY = Float(screenFrame.maxY) + 40
 
-        // Drifts only — dedicated buffers, never shared with props.
-        cullDriftStrips(minX: minX, maxX: maxX, minY: minY, maxY: maxY)
-        if !driftPosScratch.isEmpty, !driftCountScratch.isEmpty {
-            uploadMesh(
-                positions: driftPosScratch,
-                colors: driftColScratch,
-                posBuffer: &driftPosBuffer,
-                colBuffer: &driftColBuffer
-            )
-            enc.setRenderPipelineState(driftPipeline)
-            enc.setVertexBuffer(driftPosBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(driftColBuffer, offset: 0, index: 2)
-            enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
-            var start = 0
-            for n in driftCountScratch {
-                if n >= 3 {
-                    enc.drawPrimitives(type: .triangleStrip, vertexStart: start, vertexCount: n)
-                }
-                start += n
-            }
-        }
-
-        drawPointBatch(
-            simulator.flakeUpload,
-            pipeline: flakePipeline,
-            buffer: &flakeBuffer,
-            encoder: enc,
-            minX: minX, maxX: maxX, minY: minY, maxY: maxY
-        )
-        // Snowballs + snowman bodies (white).
-        drawPointBatch(
-            simulator.ballUpload,
-            pipeline: ballPipeline,
-            buffer: &ballBuffer,
-            encoder: enc,
-            minX: minX, maxX: maxX, minY: minY, maxY: maxY
-        )
-
-        // Carrot / twigs / bucket — dedicated buffers (never share with drifts).
-        if !simulator.propVertices.isEmpty {
-            // Props are few; only draw if any vertex lands on this display.
-            let onScreen = simulator.propVertices.contains {
-                $0.x >= minX && $0.x <= maxX && $0.y >= minY && $0.y <= maxY
-            }
-            if onScreen {
+        if !lanOnly {
+            // Drifts only — dedicated buffers, never shared with props.
+            cullDriftStrips(minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+            if !driftPosScratch.isEmpty, !driftCountScratch.isEmpty {
                 uploadMesh(
-                    positions: simulator.propVertices,
-                    colors: simulator.propColors,
-                    posBuffer: &propPosBuffer,
-                    colBuffer: &propColBuffer
+                    positions: driftPosScratch,
+                    colors: driftColScratch,
+                    posBuffer: &driftPosBuffer,
+                    colBuffer: &driftColBuffer
                 )
                 enc.setRenderPipelineState(driftPipeline)
-                enc.setVertexBuffer(propPosBuffer, offset: 0, index: 0)
-                enc.setVertexBuffer(propColBuffer, offset: 0, index: 2)
+                enc.setVertexBuffer(driftPosBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(driftColBuffer, offset: 0, index: 2)
                 enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: simulator.propVertices.count)
+                var start = 0
+                for n in driftCountScratch {
+                    if n >= 3 {
+                        enc.drawPrimitives(type: .triangleStrip, vertexStart: start, vertexCount: n)
+                    }
+                    start += n
+                }
             }
+
+            drawPointBatch(
+                simulator.flakeUpload,
+                pipeline: flakePipeline,
+                buffer: &flakeBuffer,
+                encoder: enc,
+                minX: minX, maxX: maxX, minY: minY, maxY: maxY
+            )
+            // Snowballs + snowman bodies (white).
+            drawPointBatch(
+                simulator.ballUpload,
+                pipeline: ballPipeline,
+                buffer: &ballBuffer,
+                encoder: enc,
+                minX: minX, maxX: maxX, minY: minY, maxY: maxY
+            )
+
+            // Carrot / twigs / bucket — dedicated buffers (never share with drifts).
+            if !simulator.propVertices.isEmpty {
+                // Props are few; only draw if any vertex lands on this display.
+                let onScreen = simulator.propVertices.contains {
+                    $0.x >= minX && $0.x <= maxX && $0.y >= minY && $0.y <= maxY
+                }
+                if onScreen {
+                    uploadMesh(
+                        positions: simulator.propVertices,
+                        colors: simulator.propColors,
+                        posBuffer: &propPosBuffer,
+                        colBuffer: &propColBuffer
+                    )
+                    enc.setRenderPipelineState(driftPipeline)
+                    enc.setVertexBuffer(propPosBuffer, offset: 0, index: 0)
+                    enc.setVertexBuffer(propColBuffer, offset: 0, index: 2)
+                    enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: simulator.propVertices.count)
+                }
+            }
+
+            // Coal eyes / smile / buttons on top.
+            drawPointBatch(
+                simulator.decorUpload,
+                pipeline: ballPipeline,
+                buffer: &decorBuffer,
+                encoder: enc,
+                minX: minX, maxX: maxX, minY: minY, maxY: maxY
+            )
         }
 
-        // Coal eyes / smile / buttons on top.
+        // Peer hits / stains — always on top of window content & fullscreen apps.
         drawPointBatch(
-            simulator.decorUpload,
+            simulator.lanOverlayUpload,
             pipeline: ballPipeline,
-            buffer: &decorBuffer,
+            buffer: &lanBuffer,
             encoder: enc,
             minX: minX, maxX: maxX, minY: minY, maxY: maxY
         )
