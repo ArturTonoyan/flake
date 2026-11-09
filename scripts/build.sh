@@ -6,19 +6,23 @@ cd "$ROOT"
 
 mkdir -p .build
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
+COMMON=(
+  -O -parse-as-library
+  -sdk "$SDK"
+  -framework AppKit
+  -framework Metal
+  -framework MetalKit
+  -framework Quartz
+  -framework CoreGraphics
+  -framework Network
+  -framework CryptoKit
+  Sources/Flake/*.swift
+)
 
-swiftc -O -parse-as-library \
-  -sdk "$SDK" \
-  -target arm64-apple-macosx13.0 \
-  -framework AppKit \
-  -framework Metal \
-  -framework MetalKit \
-  -framework Quartz \
-  -framework CoreGraphics \
-  -framework Network \
-  -framework CryptoKit \
-  Sources/Flake/*.swift \
-  -o .build/Flake
+# Universal binary: Apple Silicon + Intel
+swiftc "${COMMON[@]}" -target arm64-apple-macosx13.0 -o .build/Flake-arm64
+swiftc "${COMMON[@]}" -target x86_64-apple-macosx13.0 -o .build/Flake-x86_64
+lipo -create .build/Flake-arm64 .build/Flake-x86_64 -output .build/Flake
 
 APP="$ROOT/Flake.app"
 rm -rf "$APP"

@@ -1,5 +1,6 @@
 .build/
 Flake.app/
+dist/
 *.xcuserdata
 .DS_Store
 DerivedData/

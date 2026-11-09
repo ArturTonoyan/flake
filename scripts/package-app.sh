@@ -1,2 +1,3 @@
 #!/bin/zsh
-exec "$(cd "$(dirname "$0")" && pwd)/build.sh"
+# Совместимость: то же, что make-dmg.sh
+exec "$(cd "$(dirname "$0")" && pwd)/make-dmg.sh"

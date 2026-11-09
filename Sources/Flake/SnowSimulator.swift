@@ -11,6 +11,8 @@ struct FlakeParticle {
     var opacity: Float
     var wobble: Float
     var phase: Float
+    /// Dense grit from a pile/edge — falls like sand, not drifting fluff.
+    var heavy: Bool = false
 }
 
 struct Snowball {
@@ -204,6 +206,40 @@ struct SettledSurface {
         return taken
     }
 
+    /// Clear snow across a local-x band (another window scraping through this pile).
+    /// Returns total height removed and the peak height seen (for spawn loft).
+    mutating func scrape(fromLocalX left: Float, toLocalX right: Float, fraction: Float) -> (taken: Float, peak: Float) {
+        guard !heights.isEmpty, right > left else { return (0, 0) }
+        let lo = max(0, Int(floor(left / cellWidth)))
+        let hi = min(heights.count - 1, Int(ceil(right / cellWidth)))
+        let keep = max(0, min(1, 1 - fraction))
+        var taken: Float = 0
+        var peak: Float = 0
+        if lo <= hi {
+            for i in lo...hi {
+                let h = heights[i]
+                peak = max(peak, h)
+                let remove = h * (1 - keep)
+                heights[i] = h - remove
+                taken += remove
+            }
+        }
+        if taken > 0.01 { taperEdges() }
+        return (taken, peak)
+    }
+
+    func maxHeight(inLocalX left: Float, toLocalX right: Float) -> Float {
+        guard !heights.isEmpty, right > left else { return 0 }
+        let lo = max(0, Int(floor(left / cellWidth)))
+        let hi = min(heights.count - 1, Int(ceil(right / cellWidth)))
+        guard lo <= hi else { return 0 }
+        var peak: Float = 0
+        for i in lo...hi {
+            peak = max(peak, heights[i])
+        }
+        return peak
+    }
+
     /// Rebuild a visible pile under a snowman (bypasses addSnow's tiny per-frame cap).
     mutating func restoreMound(atLocalX localX: Float, peak: Float = 11, radius: Float = 28) {
         guard !heights.isEmpty else { return }
@@ -221,6 +257,28 @@ struct SettledSurface {
             heights[i] = min(26, max(heights[i], target))
         }
         relax(iterations: 2)
+        taperEdges()
+    }
+
+    /// Collapse a snowman into a heap ON TOP of whatever snow is already there.
+    /// Uses a higher hard cap so a maxed drift still grows a visible mound.
+    mutating func depositCollapsePile(atLocalX localX: Float, addPeak: Float, radius: Float) {
+        guard !heights.isEmpty, addPeak > 0.5 else { return }
+        let corner = cornerRadius
+        let clamped = max(corner + 1, min(ledge.width - corner - 1, localX))
+        let center = Int((clamped / cellWidth).rounded())
+        let cells = max(3, Int(ceil(radius / cellWidth)))
+        let hardCap: Float = ledge.isDock ? 36 : 52
+        for d in -cells...cells {
+            let i = center + d
+            guard i >= 0, i < heights.count else { continue }
+            let lx = Float(i) * cellWidth
+            if lx < corner || lx > ledge.width - corner { continue }
+            let t = 1 - Float(abs(d)) / Float(cells + 1)
+            // Additive bump — never silently no-op when the drift is already at the normal cap.
+            heights[i] = min(hardCap, heights[i] + addPeak * t * t)
+        }
+        relax(iterations: 1)
         taperEdges()
     }
 }
@@ -298,6 +356,8 @@ final class SnowSimulator {
     private var activeSurfaceIDs: Set<UInt32> = []
     /// After a Space switch / swipe, freeze dumps and ignore sliding frames.
     private var spaceSwitchUntil: CFTimeInterval = 0
+    /// Extra window after the swipe where drag-dumps stay disabled (reattach jitter).
+    private var spaceDumpLockUntil: CFTimeInterval = 0
     /// One-frame jump larger than this = Space animation, not a real drag.
     private let spaceJumpThreshold: Float = 36
     /// After a Space return, don't treat reattach as a drag-dump.
@@ -309,16 +369,24 @@ final class SnowSimulator {
 
     func noteSpaceSwitch() {
         let now = CACurrentMediaTime()
-        spaceSwitchUntil = now + 2.8
+        beginSpaceTransition(now: now, hold: 3.2)
         // Hide non-Dock piles until sync sees stable windows again — never dump here.
         for (id, surface) in surfaces where !surface.ledge.isDock {
             if surfaceMissingSince[id] == nil {
                 surfaceMissingSince[id] = now
             }
+            // Long guard so the return snap cannot be mistaken for a drag dump.
+            restoreGuardUntil[id] = max(restoreGuardUntil[id] ?? 0, now + 5.0)
         }
         activeSurfaceIDs = Set(surfaces.compactMap { $0.value.ledge.isDock ? $0.key : nil })
         markDriftDirty()
         // Balls/snowmen on those windows stay parked with the surface — don't leave ghosts.
+    }
+
+    private func beginSpaceTransition(now: CFTimeInterval, hold: CFTimeInterval) {
+        spaceSwitchUntil = max(spaceSwitchUntil, now + hold)
+        // Keep piles locked a bit after windows look "stable" again.
+        spaceDumpLockUntil = max(spaceDumpLockUntil, now + hold + 3.5)
     }
 
     /// True when this resting ledge belongs to another Space (cached but not drawn).
@@ -391,14 +459,39 @@ final class SnowSimulator {
     }
 
     private func isOnBlockedScreen(x: Float, y: Float) -> Bool {
-        // Tiny inset only — do not bleed into an adjacent monitor.
-        let pad: Float = 2
-        for s in snowBlockedScreens {
-            if x >= s.minX - pad, x <= s.maxX + pad, y >= s.minY - pad, y <= s.maxY + pad {
-                return true
+        // Resolve the owning display first. Screens stacked vertically share an edge;
+        // a pad/overlap test would let a fullscreen upper monitor blank the lower one
+        // (spawns start just above the lower maxY, i.e. inside the upper frame).
+        guard let host = owningScreen(x: x, y: y) else { return false }
+        return snowBlockedScreens.contains {
+            abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
+                && abs($0.minY - host.minY) < 2 && abs($0.maxY - host.maxY) < 2
+        }
+    }
+
+    /// Display that best owns this point (most interior). Used so shared edges
+    /// between stacked monitors don't inherit the neighbor's fullscreen block.
+    private func owningScreen(
+        x: Float,
+        y: Float
+    ) -> (minX: Float, maxX: Float, minY: Float, maxY: Float)? {
+        var best: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
+        var bestScore = -Float.greatestFiniteMagnitude
+        for s in screenRects {
+            let dx = min(x - s.minX, s.maxX - x)
+            let dy = min(y - s.minY, s.maxY - y)
+            // More positive = deeper inside. Slightly outside still competes so
+            // flakes spawned a few points above a lower display stay with it
+            // when nothing better claims them.
+            let score = min(dx, dy)
+            if score > bestScore {
+                bestScore = score
+                best = (minX: s.minX, maxX: s.maxX, minY: s.minY, maxY: s.maxY)
             }
         }
-        return false
+        // Reject points that are far outside every display.
+        guard bestScore > -80 else { return nil }
+        return best
     }
 
     func consumeEdgeExits() -> [OutboundSnowball] {
@@ -619,38 +712,130 @@ final class SnowSimulator {
             }
 
             // Shove snow piled on OTHER windows that this chrome sweeps through.
-            for (id, var surface) in surfaces where id != win.id && activeSurfaceIDs.contains(id) {
-                let ledge = surface.ledge
-                let bandTop = ledge.y + 26
-                let bandBot = ledge.y - 2
-                guard win.bottom < bandTop, win.y > bandBot else { continue }
-                let overlapL = max(win.x, ledge.x)
-                let overlapR = min(win.right, ledge.x + ledge.width)
-                guard overlapR > overlapL + 2 else { continue }
-                let local = (overlapL + overlapR) * 0.5 - ledge.x
-                let spill = surface.push(
-                    atLocalX: local,
-                    forceX: winVX * 0.55,
-                    forceY: winVY * 0.2
+            shoveForeignDrifts(
+                win: win,
+                prev: prev,
+                winVX: winVX,
+                winVY: winVY,
+                move: move
+            )
+        }
+    }
+
+    /// Moving window A scrapes / pushes snow sitting on window B (or Dock).
+    private func shoveForeignDrifts(
+        win: SnowWindow,
+        prev: (x: Float, y: Float, bottom: Float, right: Float),
+        winVX: Float,
+        winVY: Float,
+        move: Float
+    ) {
+        // Swept AABB so a fast drag cannot skip the pile between frames.
+        let sweepL = min(prev.x, win.x) - 4
+        let sweepR = max(prev.right, win.right) + 4
+        let sweepB = min(prev.bottom, win.bottom) - 4
+        let sweepT = max(prev.y, win.y) + 4
+
+        for (id, var surface) in surfaces where id != win.id && activeSurfaceIDs.contains(id) {
+            let ledge = surface.ledge
+            let peak = max(4, surface.maxHeight(inLocalX: 0, toLocalX: ledge.width))
+            let bandBot = ledge.y - 4
+            let bandTop = ledge.y + peak + 8
+            guard sweepB < bandTop, sweepT > bandBot else { continue }
+
+            let overlapL = max(sweepL, ledge.x)
+            let overlapR = min(sweepR, ledge.x + ledge.width)
+            guard overlapR > overlapL + 1.5 else { continue }
+
+            let localL = overlapL - ledge.x
+            let localR = overlapR - ledge.x
+            let overlapW = overlapR - overlapL
+
+            // Stronger scrape while overlapping; scale with how hard we hit.
+            let hit = min(1.6, move / 8)
+            let fraction = min(0.95, 0.35 + hit * 0.4)
+            let scraped = surface.scrape(fromLocalX: localL, toLocalX: localR, fraction: fraction)
+            if scraped.taken > 0.05 {
+                markDriftDirty()
+                ejectScrapedSnow(
+                    surface: surface,
+                    localL: localL,
+                    localR: localR,
+                    amount: scraped.taken,
+                    peak: max(scraped.peak, 4),
+                    winVX: winVX,
+                    winVY: winVY
                 )
-                if spill.left > 0.02 || spill.right > 0.02 {
-                    markDriftDirty()
-                    spillOffEdge(surface: surface, amount: spill.left, side: -1, outwardSpeed: abs(winVX))
-                    spillOffEdge(surface: surface, amount: spill.right, side: 1, outwardSpeed: abs(winVX))
-                }
-                // Scoop a bit of the overlapped pile into falling flakes.
-                let scraped = surface.scoop(atLocalX: local, radius: min(22, (overlapR - overlapL) * 0.5))
-                if scraped > 0.08 {
-                    markDriftDirty()
-                    spillOffEdge(
-                        surface: surface,
-                        amount: scraped * 0.65,
-                        side: winVX >= 0 ? 1 : -1,
-                        outwardSpeed: max(50, abs(winVX))
-                    )
-                }
-                surfaces[id] = surface
             }
+
+            // Also shove remaining snow sideways along the motion.
+            let local = (localL + localR) * 0.5
+            let spill = surface.push(
+                atLocalX: local,
+                forceX: winVX * (0.9 + hit * 0.5),
+                forceY: winVY * 0.35
+            )
+            if spill.left > 0.02 || spill.right > 0.02 {
+                markDriftDirty()
+                let speed = max(80, hypot(winVX, winVY))
+                spillOffEdge(surface: surface, amount: spill.left, side: -1, outwardSpeed: speed)
+                spillOffEdge(surface: surface, amount: spill.right, side: 1, outwardSpeed: speed)
+            }
+
+            // Extra scoop near the leading edge so the pile visibly yields.
+            let leadLocal = winVX >= 0 ? localR - min(18, overlapW * 0.4) : localL + min(18, overlapW * 0.4)
+            let scooped = surface.scoop(atLocalX: leadLocal, radius: min(28, overlapW * 0.6 + 10))
+            if scooped > 0.08 {
+                markDriftDirty()
+                ejectScrapedSnow(
+                    surface: surface,
+                    localL: leadLocal - 16,
+                    localR: leadLocal + 16,
+                    amount: scooped,
+                    peak: max(scraped.peak, 6),
+                    winVX: winVX,
+                    winVY: winVY
+                )
+            }
+
+            surfaces[id] = surface
+        }
+    }
+
+    /// Turn scraped drift height into sand-like grains pouring off the ledge.
+    private func ejectScrapedSnow(
+        surface: SettledSurface,
+        localL: Float,
+        localR: Float,
+        amount: Float,
+        peak: Float,
+        winVX: Float,
+        winVY: Float
+    ) {
+        let ledge = surface.ledge
+        let mid = (localL + localR) * 0.5
+        let span = max(8, localR - localL)
+        let count = min(28, max(3, Int(amount / 1.2)))
+        let push = max(8, min(40, abs(winVX) * 0.12))
+        let dir: Float = winVX >= 0 ? 1 : -1
+        _ = winVY
+        for _ in 0..<count {
+            guard particles.count < maxParticles else { return }
+            let lx = mid + Float.random(in: -span * 0.5...span * 0.5, using: &rng)
+            particles.append(
+                FlakeParticle(
+                    x: ledge.x + max(0, min(ledge.width, lx)),
+                    y: ledge.y + Float.random(in: 0.5...(max(2, peak) * 0.8), using: &rng),
+                    vx: dir * Float.random(in: 4...(push + 8), using: &rng)
+                        + Float.random(in: -6...6, using: &rng),
+                    vy: Float.random(in: -160...(-65), using: &rng),
+                    size: Float.random(in: 1.5...3.2, using: &rng),
+                    opacity: Float.random(in: 0.55...0.95, using: &rng),
+                    wobble: Float.random(in: 0.12...0.35, using: &rng),
+                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                    heavy: true
+                )
+            )
         }
     }
 
@@ -858,29 +1043,32 @@ final class SnowSimulator {
         let now = CACurrentMediaTime()
 
         // Three-finger Space swipe moves several windows at once before the notification fires.
+        // Detect this FIRST so the same frame cannot dump piles as "drags".
         var jumpCount = 0
         var slideCount = 0
+        var movedCount = 0
         for ledge in ledges {
             guard let prev = surfaces[ledge.id]?.ledge, !prev.isDock else { continue }
-            let dist = hypot(ledge.x - prev.x, ledge.y - prev.y)
+            let dx = abs(ledge.x - prev.x)
+            let dy = abs(ledge.y - prev.y)
+            let dist = hypot(dx, dy)
             if dist >= spaceJumpThreshold { jumpCount += 1 }
-            // Coherent horizontal slide = Space animation (even in small per-frame steps).
-            if dist > 6, abs(ledge.x - prev.x) > abs(ledge.y - prev.y) * 1.2 {
-                slideCount += 1
-            }
+            if dist > 6, dx > dy * 1.2 { slideCount += 1 }
+            if dist > 2.5 || abs(ledge.width - prev.width) > 4 { movedCount += 1 }
         }
-        if jumpCount >= 2 || slideCount >= 2 {
-            spaceSwitchUntil = max(spaceSwitchUntil, now + 1.6)
+        if jumpCount >= 2 || slideCount >= 2 || movedCount >= 3 {
+            beginSpaceTransition(now: now, hold: 2.4)
         }
 
         let inSpaceCooldown = now < spaceSwitchUntil
+        let dumpLocked = inSpaceCooldown || now < spaceDumpLockUntil
         var drawIDs = Set<UInt32>()
 
         for ledge in ledges {
             seen.insert(ledge.id)
             let returnedFromSpace = surfaceMissingSince.removeValue(forKey: ledge.id) != nil
             if returnedFromSpace {
-                restoreGuardUntil[ledge.id] = now + 2.0
+                restoreGuardUntil[ledge.id] = max(restoreGuardUntil[ledge.id] ?? 0, now + 5.0)
             }
             let guarded = (restoreGuardUntil[ledge.id] ?? 0) > now
 
@@ -906,23 +1094,15 @@ final class SnowSimulator {
                     continue
                 }
 
-                if jump && (returnedFromSpace || guarded) {
-                    // Back on this Space: snap the saved pile onto the live frame.
+                if jump || returnedFromSpace || guarded || (nudged && dumpLocked) {
+                    // Space return / protected reattach: keep the pile, snap to the live frame.
                     existing.resize(to: ledge, cellWidth: cellWidth)
                     existing.taperEdges()
                     surfaces[ledge.id] = existing
                     drawIDs.insert(ledge.id)
                     markDriftDirty()
-                } else if jump {
-                    // Lone teleport (rare): reattach without dumping so we don't lock out.
-                    existing.resize(to: ledge, cellWidth: cellWidth)
-                    existing.taperEdges()
-                    surfaces[ledge.id] = existing
-                    drawIDs.insert(ledge.id)
-                    markDriftDirty()
-                } else if nudged && !guarded && !ledge.isDock {
-                    // Dragging: dump snow once, knock balls/snowmen loose so they fall
-                    // like flakes (do not ride the window), then follow the empty ledge.
+                } else if nudged && !ledge.isDock {
+                    // Real drag only — never while a Space transition is still settling.
                     noSettleUntil[ledge.id] = now + 0.55
                     detachPropsFromMovingLedge(ledge.id)
                     let canDump = now >= (dumpCooldownUntil[ledge.id] ?? 0)
@@ -935,7 +1115,6 @@ final class SnowSimulator {
                     } else {
                         existing.resize(to: ledge, cellWidth: cellWidth)
                         existing.taperEdges()
-                        // Clear any pile that re-formed during the shake.
                         for i in existing.heights.indices { existing.heights[i] = 0 }
                         surfaces[ledge.id] = existing
                     }
@@ -951,13 +1130,20 @@ final class SnowSimulator {
                     drawIDs.insert(ledge.id)
                 }
             } else {
-                // Always create a surface for any live ledge (incl. after Space / new window id).
-                var fresh = SettledSurface(ledge: ledge, heights: [], cellWidth: cellWidth)
-                fresh.resize(to: ledge, cellWidth: cellWidth)
-                surfaces[ledge.id] = fresh
-                // Don't draw brand-new piles while Spaces are still sliding.
-                if !inSpaceCooldown || ledge.isDock {
+                // Try to reclaim a cached pile from an off-Space window with a new id
+                // (rare) by matching pose; otherwise start empty.
+                if let reclaimed = reclaimCachedSurface(for: ledge) {
+                    surfaces[ledge.id] = reclaimed
+                    restoreGuardUntil[ledge.id] = max(restoreGuardUntil[ledge.id] ?? 0, now + 5.0)
                     drawIDs.insert(ledge.id)
+                    markDriftDirty()
+                } else {
+                    var fresh = SettledSurface(ledge: ledge, heights: [], cellWidth: cellWidth)
+                    fresh.resize(to: ledge, cellWidth: cellWidth)
+                    surfaces[ledge.id] = fresh
+                    if !inSpaceCooldown || ledge.isDock {
+                        drawIDs.insert(ledge.id)
+                    }
                 }
             }
         }
@@ -973,9 +1159,12 @@ final class SnowSimulator {
             if surfaces[id]?.ledge.isDock == true { continue }
             let since = surfaceMissingSince[id] ?? now
             surfaceMissingSince[id] = since
+            // During / after a Space swipe, never expire piles — only truly abandoned ones.
+            if dumpLocked { continue }
             if now - since >= surfaceGrace {
                 if let surface = surfaces.removeValue(forKey: id) {
-                    releaseSurface(surface)
+                    // Drop quietly — do not pour grit when leaving a Space.
+                    _ = surface
                 }
                 surfaceMissingSince.removeValue(forKey: id)
                 restoreGuardUntil.removeValue(forKey: id)
@@ -983,6 +1172,34 @@ final class SnowSimulator {
                 noSettleUntil.removeValue(forKey: id)
             }
         }
+    }
+
+    /// If a window comes back under a new CGWindow id, reuse the nearest cached pile.
+    private func reclaimCachedSurface(for ledge: SnowLedge) -> SettledSurface? {
+        guard !ledge.isDock else { return nil }
+        var bestID: UInt32?
+        var bestScore = Float.greatestFiniteMagnitude
+        for (id, surface) in surfaces {
+            guard surfaceMissingSince[id] != nil else { continue }
+            guard !surface.ledge.isDock else { continue }
+            let prev = surface.ledge
+            let dw = abs(prev.width - ledge.width)
+            guard dw < 80 else { continue }
+            let dist = hypot(prev.x - ledge.x, prev.y - ledge.y)
+            let score = dist + dw * 2
+            // Only reclaim when the pose is clearly the same window returning.
+            guard score < 120 else { continue }
+            if score < bestScore {
+                bestScore = score
+                bestID = id
+            }
+        }
+        guard let bestID, var stolen = surfaces.removeValue(forKey: bestID) else { return nil }
+        surfaceMissingSince.removeValue(forKey: bestID)
+        restoreGuardUntil.removeValue(forKey: bestID)
+        stolen.resize(to: ledge, cellWidth: cellWidth)
+        stolen.taperEdges()
+        return stolen
     }
 
     private func activeLedges(from ledges: [SnowLedge]) -> [SnowLedge] {
@@ -1005,7 +1222,7 @@ final class SnowSimulator {
 
     private func releaseSurface(_ surface: SettledSurface) {
         let ledge = surface.ledge
-        // Sparse dump — enough to look like falling snow, not a particle storm.
+        // Pour off the ledge like sand — mostly down, little sideways spray.
         for (i, h) in surface.heights.enumerated() where h > 0.5 {
             let count = min(3, Int(h / 4.0) + 1)
             let lx = Float(i) * surface.cellWidth
@@ -1016,13 +1233,14 @@ final class SnowSimulator {
                 particles.append(
                     FlakeParticle(
                         x: ledge.x + lx + Float.random(in: -1.5...1.5, using: &rng),
-                        y: ledge.y + h * Float.random(in: 0.2...1.0, using: &rng),
-                        vx: Float.random(in: -40...40, using: &rng),
-                        vy: Float.random(in: -55...(-10), using: &rng),
-                        size: Float.random(in: 1.6...3.4, using: &rng),
+                        y: ledge.y + h * Float.random(in: 0.05...0.85, using: &rng),
+                        vx: Float.random(in: -10...10, using: &rng),
+                        vy: Float.random(in: -150...(-60), using: &rng),
+                        size: Float.random(in: 1.5...3.2, using: &rng),
                         opacity: Float.random(in: 0.55...0.95, using: &rng),
-                        wobble: Float.random(in: 0.6...1.6, using: &rng),
-                        phase: Float.random(in: 0...(2 * .pi), using: &rng)
+                        wobble: Float.random(in: 0.15...0.4, using: &rng),
+                        phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                        heavy: true
                     )
                 )
             }
@@ -1043,12 +1261,22 @@ final class SnowSimulator {
             }) {
                 continue
             }
+            // If another display sits above this one, spawning above maxY lands
+            // inside the neighbor — keep flakes on this screen's top strip.
+            let neighborAbove = screenRects.contains {
+                abs($0.minY - screen.minY) > 2 && $0.minY >= screen.maxY - 2
+            }
             var acc = max(22, perPoint * screen.width) * dt
             // Reuse global accumulator sliced per screen via local loop.
             while acc >= 1, particles.count < maxParticles {
                 acc -= 1
                 let x = Float.random(in: screen.minX...screen.maxX, using: &rng)
-                let y = screen.maxY + Float.random(in: 4...48, using: &rng)
+                let y: Float
+                if neighborAbove {
+                    y = screen.maxY - Float.random(in: 1...14, using: &rng)
+                } else {
+                    y = screen.maxY + Float.random(in: 4...48, using: &rng)
+                }
                 particles.append(
                     FlakeParticle(
                         x: x,
@@ -1076,10 +1304,18 @@ final class SnowSimulator {
         for i in particles.indices {
             var p = particles[i]
             p.phase += dt * 2.2
-            p.vx += (wind - p.vx) * dt * 0.15
-            p.x += (p.vx + sinf(p.phase) * 14 * p.wobble) * dt
-            p.y += p.vy * dt
-            p.vy -= 18 * dt
+            if p.heavy {
+                // Sand / grit: kill sideways drift fast, fall hard.
+                p.vx *= max(0, 1 - 5.5 * dt)
+                p.x += p.vx * dt
+                p.y += p.vy * dt
+                p.vy -= 380 * dt
+            } else {
+                p.vx += (wind - p.vx) * dt * 0.15
+                p.x += (p.vx + sinf(p.phase) * 14 * p.wobble) * dt
+                p.y += p.vy * dt
+                p.vy -= 18 * dt
+            }
 
             // Cheap rejects before window tests.
             if isOnBlockedScreen(x: p.x, y: p.y) { continue }
@@ -1381,10 +1617,10 @@ final class SnowSimulator {
         return hit
     }
 
-    /// Hit a snowman with a flying snowball → smash into three free balls.
+    /// Hit a snowman with a flying snowball → collapse into a snow pile on the drift.
     @discardableResult
     private func smashSnowmanIfHit(byBall ballIndex: Int) -> Bool {
-        guard balls.indices.contains(ballIndex), balls.count < maxBalls - 2 else { return false }
+        guard balls.indices.contains(ballIndex) else { return false }
         let b = balls[ballIndex]
         let speed = hypot(b.vx, b.vy)
         guard speed > 120 else { return false }
@@ -1406,36 +1642,48 @@ final class SnowSimulator {
         }
         guard let sIdx = hit, hitD < 6 else { return false }
         let s = snowmen[sIdx]
-        let nx = b.vx / speed
-        let ny = b.vy / speed
+        let totalMass = s.baseMass + s.midMass + s.headMass + b.mass
 
-        // Scatter three body parts.
-        let parts: [(Float, Float, Float, Float)] = [
-            (s.x, s.y, s.baseMass, 0),
-            (s.x, s.midY, s.midMass, 0.4),
-            (s.x, s.headY, s.headMass, 0.8),
-        ]
-        for (px, py, mass, kick) in parts where balls.count < maxBalls {
-            let side = Float.random(in: -1...1, using: &rng)
-            balls.append(
-                Snowball(
-                    x: px + side * 4,
-                    y: py + 4,
-                    vx: nx * (120 + kick * 80) + side * 90,
-                    vy: ny * (80 + kick * 60) + Float.random(in: 40...140, using: &rng),
-                    mass: mass,
-                    held: false,
-                    stackedOn: nil,
-                    restingLedge: nil
-                )
+        // Prefer the ledge the snowman stood on; else whatever sits under it.
+        var lid = s.restingLedge
+        if lid == nil || surfaces[lid!] == nil {
+            lid = nearestLedgeID(underX: s.x, nearY: s.y)
+        }
+        // Heap size from body mass — always a visible bump, even on a maxed drift.
+        let addPeak = max(14, min(28, 10 + sqrtf(totalMass) * 1.55))
+        let radius = max(28, min(70, s.baseR * 2.8 + sqrtf(totalMass)))
+
+        if let lid, var surface = surfaces[lid] {
+            let ledge = surface.ledge
+            let corner = surface.cornerRadius
+            let local = max(corner + 2, min(ledge.width - corner - 2, s.x - ledge.x))
+            let before = surface.height(atLocalX: local)
+            surface.depositCollapsePile(atLocalX: local, addPeak: addPeak, radius: radius)
+            surfaces[lid] = surface
+            // Ensure the surface is drawn even if it was briefly inactive.
+            activeSurfaceIDs.insert(lid)
+            markDriftDirty()
+            let after = surface.height(atLocalX: local)
+            emitSandCascade(
+                x: s.x,
+                fromY: s.headY,
+                toY: ledge.y + max(before, after) * 0.5,
+                count: min(28, Int(totalMass * 0.25) + 8),
+                outward: 8
+            )
+        } else {
+            // Nowhere to pile — still leave a falling heap of grit (settles below).
+            emitSandCascade(
+                x: s.x,
+                fromY: s.headY,
+                toY: s.y - s.baseR,
+                count: min(64, Int(totalMass * 0.55) + 24),
+                outward: 16
             )
         }
 
-        // Projectile bounces off / loses energy.
-        balls[ballIndex].vx = -nx * speed * 0.35 + Float.random(in: -40...40, using: &rng)
-        balls[ballIndex].vy = abs(ny) * speed * 0.25 + 60
-        balls[ballIndex].restingLedge = nil
-        balls[ballIndex].mass = max(4, balls[ballIndex].mass * 0.7)
+        // Snowball melts into the same pile.
+        balls[ballIndex].mass = 0
 
         snowmen.remove(at: sIdx)
         if let h = heldSnowmanIndex {
@@ -1443,6 +1691,57 @@ final class SnowSimulator {
             else if h > sIdx { heldSnowmanIndex = h - 1 }
         }
         return true
+    }
+
+    private func nearestLedgeID(underX x: Float, nearY y: Float) -> UInt32? {
+        var best: UInt32?
+        var bestScore = Float.greatestFiniteMagnitude
+        // Prefer live ledges, but also accept cached surfaces (Space / brief miss).
+        let ids = activeSurfaceIDs.union(Set(surfaces.keys))
+        for id in ids {
+            guard let surface = surfaces[id] else { continue }
+            let ledge = surface.ledge
+            guard x >= ledge.x - 12, x <= ledge.x + ledge.width + 12 else { continue }
+            let pile = surface.height(atLocalX: max(0, min(ledge.width, x - ledge.x)))
+            let top = ledge.y + pile
+            // Snowman base near the snow / ledge top.
+            let dy = y - top
+            guard dy >= -40, dy < 280 else { continue }
+            let score = abs(dy) + (dy < -5 ? 50 : 0) + (activeSurfaceIDs.contains(id) ? 0 : 30)
+            if score < bestScore {
+                bestScore = score
+                best = id
+            }
+        }
+        return best
+    }
+
+    /// Dense particles that pour downward (edge spill / snowman collapse).
+    private func emitSandCascade(
+        x: Float,
+        fromY: Float,
+        toY: Float,
+        count: Int,
+        outward: Float
+    ) {
+        let top = max(fromY, toY)
+        let bot = min(fromY, toY)
+        for _ in 0..<count {
+            guard particles.count < maxParticles else { return }
+            particles.append(
+                FlakeParticle(
+                    x: x + Float.random(in: -outward...outward, using: &rng),
+                    y: Float.random(in: bot...max(bot + 1, top), using: &rng),
+                    vx: Float.random(in: -outward * 0.35...outward * 0.35, using: &rng),
+                    vy: Float.random(in: -160...(-55), using: &rng),
+                    size: Float.random(in: 1.5...3.2, using: &rng),
+                    opacity: Float.random(in: 0.6...0.95, using: &rng),
+                    wobble: Float.random(in: 0.15...0.35, using: &rng),
+                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                    heavy: true
+                )
+            )
+        }
     }
 
     private func settleBallOnLedgeIfNeeded(_ index: Int) {
@@ -2238,20 +2537,25 @@ final class SnowSimulator {
     private func spillOffEdge(surface: SettledSurface, amount: Float, side: Float, outwardSpeed: Float) {
         guard amount > 0.15 else { return }
         let ledge = surface.ledge
-        let edgeX = side < 0 ? ledge.x - 2 : ledge.x + ledge.width + 2
-        let n = min(14, Int(amount * 1.4) + 1)
+        // Just past the rounded corner, then pour straight down.
+        let edgeX = side < 0 ? ledge.x - 1.5 : ledge.x + ledge.width + 1.5
+        let n = min(18, Int(amount * 1.6) + 1)
+        // outwardSpeed only decides how many grains — not a balloon kick.
+        _ = outwardSpeed
         for _ in 0..<n where particles.count < maxParticles {
             let h = surface.height(atLocalX: side < 0 ? 0 : ledge.width)
             particles.append(
                 FlakeParticle(
-                    x: edgeX + Float.random(in: -3...3, using: &rng),
-                    y: ledge.y + max(h, 2) + Float.random(in: 0...6, using: &rng),
-                    vx: side * (35 + outwardSpeed * 0.15) + Float.random(in: -15...15, using: &rng),
-                    vy: Float.random(in: -55...(-8), using: &rng),
-                    size: Float.random(in: 1.4...3.3, using: &rng),
-                    opacity: Float.random(in: 0.5...0.95, using: &rng),
-                    wobble: Float.random(in: 0.6...1.5, using: &rng),
-                    phase: Float.random(in: 0...(2 * .pi), using: &rng)
+                    x: edgeX + side * Float.random(in: 0...3, using: &rng),
+                    y: ledge.y + Float.random(in: 0...(max(2, h) * 0.7), using: &rng),
+                    vx: side * Float.random(in: 4...16, using: &rng)
+                        + Float.random(in: -4...4, using: &rng),
+                    vy: Float.random(in: -170...(-70), using: &rng),
+                    size: Float.random(in: 1.4...3.1, using: &rng),
+                    opacity: Float.random(in: 0.55...0.95, using: &rng),
+                    wobble: Float.random(in: 0.12...0.35, using: &rng),
+                    phase: Float.random(in: 0...(2 * .pi), using: &rng),
+                    heavy: true
                 )
             )
         }
