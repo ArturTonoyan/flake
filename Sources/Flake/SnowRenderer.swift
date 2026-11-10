@@ -43,6 +43,11 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
     private var driftPosScratch: [SIMD2<Float>] = []
     private var driftColScratch: [SIMD4<Float>] = []
     private var driftCountScratch: [Int] = []
+    /// Consecutive nil `currentDrawable` — secondary monitors can wedge the pool
+    /// after a Space swipe; heal by toggling drawableSize.
+    private var nilDrawableStreak = 0
+    /// Set by OverlayController before `view.draw()` (valid only inside that draw).
+    var renderLanOnly = false
 
     init?(view: MTKView, simulator: SnowSimulator, screenFrame: NSRect) {
         guard
@@ -58,11 +63,17 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         view.device = device
         view.colorPixelFormat = .bgra8Unorm
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        view.isPaused = false
+        // Paused + explicit `draw()` from the shared CVDisplayLink tick.
+        // Do NOT leave isPaused=false: each MTKView would also auto-draw and
+        // starve the other monitor's drawable pool.
+        view.isPaused = true
         view.enableSetNeedsDisplay = false
         view.preferredFramesPerSecond = 30
         view.sampleCount = 1
         view.framebufferOnly = true
+        if let metalLayer = view.layer as? CAMetalLayer {
+            metalLayer.allowsNextDrawableTimeout = true
+        }
 
         guard
             let library = try? device.makeLibrary(source: MetalShaders.source, options: nil),
@@ -155,13 +166,27 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        render(into: view)
+        // Only valid path for currentDrawable on a paused MTKView: inside draw().
+        render(into: view, lanOnly: renderLanOnly)
     }
 
     func render(into view: MTKView, lanOnly: Bool = false) {
+        if let metalLayer = view.layer as? CAMetalLayer {
+            metalLayer.allowsNextDrawableTimeout = true
+        }
         guard
-            let drawable = view.currentDrawable,
             let rpd = view.currentRenderPassDescriptor,
+            let drawable = view.currentDrawable
+        else {
+            nilDrawableStreak += 1
+            if nilDrawableStreak >= 4 {
+                healDrawablePool(view)
+                nilDrawableStreak = 0
+            }
+            return
+        }
+        nilDrawableStreak = 0
+        guard
             let cmd = queue.makeCommandBuffer(),
             let enc = cmd.makeRenderCommandEncoder(descriptor: rpd)
         else { return }
@@ -289,6 +314,18 @@ final class SnowRenderer: NSObject, MTKViewDelegate {
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
+    }
+
+    /// Discard a wedged CAMetalLayer drawable pool without recreating the view.
+    private func healDrawablePool(_ view: MTKView) {
+        let size = view.drawableSize
+        guard size.width > 2, size.height > 2 else { return }
+        view.drawableSize = CGSize(width: size.width - 1, height: size.height)
+        view.drawableSize = size
+        NSLog(
+            "Flake: healed Metal drawable pool for screen (%.0f,%.0f %.0fx%.0f)",
+            screenFrame.minX, screenFrame.minY, screenFrame.width, screenFrame.height
+        )
     }
 
     private func drawSoftBallMesh(

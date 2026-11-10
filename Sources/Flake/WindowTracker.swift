@@ -415,11 +415,13 @@ final class WindowTracker {
                 && CGFloat(topY) >= full.maxY - 8
 
             // Near-fullscreen even with a few pixels of chrome / shadow inset.
+            // Keep this strict — loose thresholds treated normal big windows as
+            // maximized and permanently parked snowfall on that display.
             let coversMost =
-                CGFloat(width) >= full.width * 0.92
-                && CGFloat(height) >= full.height * 0.82
-                && CGFloat(x) <= full.minX + full.width * 0.06
-                && bottom <= full.minY + full.height * 0.12
+                CGFloat(width) >= full.width * 0.94
+                && CGFloat(height) >= full.height * 0.90
+                && CGFloat(x) <= full.minX + full.width * 0.04
+                && bottom <= full.minY + full.height * 0.08
 
             if coversVisible || coversFull || coversMost { return true }
         }

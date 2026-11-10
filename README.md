@@ -37,6 +37,8 @@ cp -R ./Flake.app /Applications/ && open /Applications/Flake.app
 
 Сборка — универсальная (`arm64` + `x86_64`), подходит и для Apple Silicon, и для Intel.
 
+Как выложить новую версию на GitHub Releases: см. [RELEASE.md](RELEASE.md).
+
 ## Остановить
 
 Меню снежинки в строке меню → **Выход**.

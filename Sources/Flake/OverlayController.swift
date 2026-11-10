@@ -23,6 +23,8 @@ final class OverlayController {
     let peerNetwork = PeerSnowNetwork()
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
+    private var appActivateObserver: NSObjectProtocol?
+    private var lastFrontPID: pid_t = 0
     private var displayLink: CVDisplayLink?
     private var lastTick = CACurrentMediaTime()
     private var lastMouse = NSEvent.mouseLocation
@@ -35,8 +37,9 @@ final class OverlayController {
     var onLanPeersChanged: (() -> Void)?
     private let toast = LanToastBanner()
     private let snowmanPoster = InboundSnowmanPoster()
-    /// Smooth overlay opacity during Space swipe / maximized blanking (0…1).
-    private var overlayFade: CGFloat = 1
+    /// Per-display overlay opacity during Space swipe (0…1). Dual monitors with
+    /// separate Spaces must not fade the idle display when the other swipes.
+    private var overlayFades: [CGDirectDisplayID: CGFloat] = [:]
     /// Status-item / app menu is open — keep snow from covering it.
     var menuOccludesSnow = false
 
@@ -79,8 +82,24 @@ final class OverlayController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.simulator.noteSpaceSwitch()
+            guard let self else { return }
+            self.simulator.noteSpaceSwitch()
+            self.hardBlankBlockedOverlays()
         }
+
+        appActivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.simulator.noteFocusSwitch()
+            // Fresh window list before the next display tick paints snow.
+            let windows = self.tracker.windows(force: true, active: true)
+            self.simulator.update(dt: 1.0 / 60.0, windows: windows)
+            self.hardBlankBlockedOverlays()
+        }
+        lastFrontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
     }
 
     func stop() {
@@ -93,7 +112,24 @@ final class OverlayController {
         if let spaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(spaceObserver)
         }
+        if let appActivateObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivateObserver)
+        }
         tearDownOverlays()
+    }
+
+    /// Instantly clear + hide overlays on blanked displays (no fade).
+    private func hardBlankBlockedOverlays() {
+        for item in overlays {
+            let blocked = simulator.isSnowBlocked(screenFrame: item.renderer.screenFrame)
+                || simulator.isSpaceTransitioning(on: item.renderer.screenFrame)
+            guard blocked else { continue }
+            item.renderer.renderLanOnly = true
+            if !item.view.isPaused { item.view.isPaused = true }
+            item.view.draw()
+            item.panel.alphaValue = 0
+            overlayFades[item.screenID] = 0
+        }
     }
 
     private func wirePeerNetwork() {
@@ -293,6 +329,7 @@ final class OverlayController {
             item.view.delegate = nil
         }
         overlays.removeAll()
+        overlayFades.removeAll(keepingCapacity: true)
     }
 
     private func rebuildOverlays() {
@@ -338,8 +375,9 @@ final class OverlayController {
             let view = MTKView(frame: NSRect(origin: .zero, size: frame.size), device: device)
             view.autoresizingMask = [.width, .height]
             view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            // Manual ticks only — auto-draw + dual monitors exhausts drawable pools.
             view.isPaused = true
-            view.enableSetNeedsDisplay = true
+            view.enableSetNeedsDisplay = false
             view.preferredFramesPerSecond = 30
             view.wantsLayer = true
             view.layer?.isOpaque = false
@@ -348,6 +386,7 @@ final class OverlayController {
                 metalLayer.isOpaque = false
                 metalLayer.backgroundColor = NSColor.clear.cgColor
                 metalLayer.contentsScale = screen.backingScaleFactor
+                metalLayer.allowsNextDrawableTimeout = true
             }
 
             panel.contentView = view
@@ -369,6 +408,7 @@ final class OverlayController {
                     signHUD: signHUD
                 )
             )
+            overlayFades[screenID] = overlayFades[screenID] ?? 1
             panel.orderFrontRegardless()
         }
         NSLog("Flake: active overlays=\(overlays.count)")
@@ -453,12 +493,17 @@ final class OverlayController {
         let pressed = (NSEvent.pressedMouseButtons & (1 << 0)) != 0
         simulator.mouseDown = pressed
         simulator.mouseEnabled = mouseInteractionEnabled
-        let trackingActive = pressed || hypot(moveX, moveY) > 0.5
+
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        if frontPID != 0, frontPID != lastFrontPID {
+            lastFrontPID = frontPID
+            simulator.noteFocusSwitch()
+        }
 
         if !isPaused {
             updateWorldBounds()
-            // Force a fresh window scan while dragging so drifts stick to the title bar.
-            simulator.update(dt: dt, windows: tracker.windows(force: pressed, active: trackingActive))
+            // Force each tick — maximized blanking must not lag a cached window list.
+            simulator.update(dt: dt, windows: tracker.windows(force: true, active: true))
             if lanSnowballsEnabled {
                 for exit in simulator.consumeEdgeExits() {
                     peerNetwork.sendSnowball(exit)
@@ -474,56 +519,72 @@ final class OverlayController {
 
         let signEntries = simulator.snowmenSignHUD()
         let hasLanHits = simulator.hasActiveLanImpacts
-        // Keep snow through the start of the swipe; start revealing before freeze ends.
-        let concealSpace =
-            simulator.isSpaceTransitioning
-            && simulator.spaceTransitionAge > 0.28
-            && simulator.spaceTransitionRemaining > 0.38
-        let spaceTarget: CGFloat = concealSpace ? 0 : 1
-        let spaceSpeed: CGFloat = spaceTarget < overlayFade ? 2.6 : 5.8
-        let spaceStep = min(1 as CGFloat, max(0, CGFloat(dt)) * spaceSpeed)
-        overlayFade += (spaceTarget - overlayFade) * spaceStep
-        if abs(overlayFade - spaceTarget) < 0.012 { overlayFade = spaceTarget }
 
         for item in overlays {
             item.signHUD.sync(entries: signEntries, panel: item.panel)
+            // Hide immediately on Space swipe — delayed fade let snow flash on fullscreen.
+            let concealSpace = simulator.isSpaceTransitioning(on: item.renderer.screenFrame)
+            let spaceTarget: CGFloat = concealSpace ? 0 : 1
+            var fade = overlayFades[item.screenID] ?? 1
+            if concealSpace {
+                fade = 0
+            } else {
+                let spaceSpeed: CGFloat = 5.8
+                let spaceStep = min(1 as CGFloat, max(0, CGFloat(dt)) * spaceSpeed)
+                fade += (spaceTarget - fade) * spaceStep
+                if abs(fade - spaceTarget) < 0.012 { fade = spaceTarget }
+            }
+            overlayFades[item.screenID] = fade
+
             // Maximized / fullscreen → hide regular snow, but keep the panel up for peer hits.
-            // Space swipe: screen-fixed overlay fades instead of hard-cutting.
             let blocked = simulator.isSnowBlocked(screenFrame: item.renderer.screenFrame)
             let showLan = hasLanHits && simulator.hasLanImpacts(in: item.renderer.screenFrame)
+            let blank = (blocked || concealSpace) && !showLan
             let want: CGFloat
-            if menuOccludesSnow && !showLan {
-                // Hard-hide while our settings menu is open (level alone isn't enough —
-                // orderFrontRegardless can still paint over the status-item menu).
-                want = 0
-            } else if showLan {
+            if showLan {
                 want = 1
-            } else if blocked {
+            } else if blank {
                 want = 0
             } else {
-                want = overlayFade
+                want = fade
             }
-            let cur = item.panel.alphaValue
-            let panelSpeed: CGFloat = want < cur ? 8.0 : 6.0
-            let panelStep = min(1 as CGFloat, max(0, CGFloat(dt)) * panelSpeed)
-            let alpha = abs(want - cur) < 0.012 ? want : cur + (want - cur) * panelStep
+            // Blanking must be instant — any fade paints snow over the app.
+            let alpha: CGFloat
+            if blank {
+                alpha = 0
+            } else {
+                let cur = item.panel.alphaValue
+                let panelSpeed: CGFloat = want < cur ? 8.0 : 6.0
+                let panelStep = min(1 as CGFloat, max(0, CGFloat(dt)) * panelSpeed)
+                alpha = abs(want - cur) < 0.012 ? want : cur + (want - cur) * panelStep
+            }
             if item.panel.alphaValue != alpha {
                 item.panel.alphaValue = alpha
-            }
-            if alpha < 0.02 && !showLan {
-                if menuOccludesSnow {
-                    item.panel.orderBack(nil)
-                }
-                continue
             }
             // Keep a stable level under menus; LAN hits use the same stack (still over apps).
             if item.panel.level != Self.snowOverlayLevel {
                 item.panel.level = Self.snowOverlayLevel
             }
-            if !menuOccludesSnow, showLan || item.panel.isVisible || alpha > 0.02 {
+            if !item.view.isPaused { item.view.isPaused = true }
+
+            if blank {
+                // Clear the last snow frame from the Metal layer, then stay hidden.
+                item.renderer.renderLanOnly = true
+                item.view.draw()
+                continue
+            }
+            if alpha < 0.02 && !showLan {
+                continue
+            }
+            // While the status menu is open, don't orderFrontRegardless — that can
+            // cover the menu. Snow stays visible underneath (level is below pop-ups).
+            if menuOccludesSnow {
+                // no-op: leave current z-order alone
+            } else if showLan || item.panel.isVisible || alpha > 0.02 {
                 item.panel.orderFrontRegardless()
             }
-            item.renderer.render(into: item.view, lanOnly: blocked && showLan)
+            item.renderer.renderLanOnly = blocked
+            item.view.draw()
         }
     }
 }

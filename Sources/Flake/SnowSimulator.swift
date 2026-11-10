@@ -580,8 +580,15 @@ final class SnowSimulator {
     private var worldMaxY: Float = 1080
     /// Each screen rect in global Cocoa points — spawn evenly per display.
     private var screenRects: [(minX: Float, maxX: Float, minY: Float, maxY: Float, width: Float)] = []
-    /// Screens covered by a maximized / fullscreen window — no snow at all there.
+    /// Screens covered by a maximized / fullscreen window — overlay blanking.
     private var snowBlockedScreens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
+    /// Live maximized this frame only — spawn/physics use this, not sticky overlay blank.
+    private var liveBlockedScreens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
+    /// Last live maximized screens — held briefly so Cmd+Tab / focus flicker
+    /// cannot flash snow over a fullscreen app for a frame.
+    private var stickyBlockedScreens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
+    private var snowBlockedStickyUntil: CFTimeInterval = 0
+    private let snowBlockedHold: CFTimeInterval = 0.22
 
     private var spawnAccumulator: Float = 0
     private let maxBalls = 24
@@ -673,36 +680,110 @@ final class SnowSimulator {
     private var noSettleUntil: [UInt32: CFTimeInterval] = [:]
 
     /// Overlay is screen-fixed (`stationary`); during a Space swipe it cannot track the
-    /// sliding desktop — hide + freeze instead of drawing snow over the black gap.
+    /// sliding desktop — hide + freeze on the affected display(s) only.
     private(set) var isSpaceTransitioning: Bool = false
     /// Seconds left on the Space freeze clock (for smooth overlay fade-in before unfreeze).
     private(set) var spaceTransitionRemaining: CFTimeInterval = 0
     /// When the current Space transition was first armed (fade-out delay).
     private var spaceTransitionStartedAt: CFTimeInterval = 0
+    /// Displays whose Spaces are sliding — neighbor monitors keep snow falling.
+    private var spaceFrozenScreens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
 
     func noteSpaceSwitch() {
         let now = CACurrentMediaTime()
         // Notification fires at the end of the gesture — brief settle only.
-        beginSpaceTransition(now: now, hold: 0.7)
-        for (id, surface) in surfaces where !surface.ledge.isDock {
-            if surfaceMissingSince[id] == nil {
-                surfaceMissingSince[id] = now
-            }
-            restoreGuardUntil[id] = max(restoreGuardUntil[id] ?? 0, now + 4.0)
-        }
+        // Do NOT mark every pile missing: with "Displays have separate Spaces" the
+        // other monitor's windows never left and must keep their drifts.
+        beginSpaceTransition(now: now, hold: 0.45, screens: nil)
+        // Only keep blanking screens that were actually maximized — never blank-all
+        // (that parked snowfall on ordinary windowed desktops).
+        armBlockedSticky(now: now, hold: snowBlockedHold)
         markDriftDirty()
+    }
+
+    /// Cmd+Tab / click focus — blank sticky maximized screens immediately so snow
+    /// cannot paint over a fullscreen app for a frame before CGWindowList catches up.
+    func noteFocusSwitch() {
+        armBlockedSticky(now: CACurrentMediaTime(), hold: snowBlockedHold)
+    }
+
+    private func armBlockedSticky(now: CFTimeInterval, hold: CFTimeInterval) {
+        var seeded = liveBlockedScreens
+        if seeded.isEmpty { seeded = stickyBlockedScreens }
+        // Only true maximized windows — large normal windows must not blank a display.
+        for win in occluders where win.isMaximized && !win.isDock {
+            guard let host = hostScreen(of: win) else { continue }
+            if !seeded.contains(where: {
+                abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
+            }) {
+                seeded.append(host)
+            }
+        }
+        guard !seeded.isEmpty else { return }
+        stickyBlockedScreens = seeded
+        snowBlockedScreens = mergeBlocked(liveBlockedScreens, sticky: seeded)
+        snowBlockedStickyUntil = now + hold
+    }
+
+    private func mergeBlocked(
+        _ live: [(minX: Float, maxX: Float, minY: Float, maxY: Float)],
+        sticky: [(minX: Float, maxX: Float, minY: Float, maxY: Float)]
+    ) -> [(minX: Float, maxX: Float, minY: Float, maxY: Float)] {
+        var out = live
+        for s in sticky {
+            if !out.contains(where: {
+                abs($0.minX - s.minX) < 2 && abs($0.maxX - s.maxX) < 2
+            }) {
+                out.append(s)
+            }
+        }
+        return out
     }
 
     private var wasSpaceTransitioning = false
 
-    private func beginSpaceTransition(now: CFTimeInterval, hold: CFTimeInterval) {
-        if now >= spaceSwitchUntil {
+    private func beginSpaceTransition(
+        now: CFTimeInterval,
+        hold: CFTimeInterval,
+        screens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)]?
+    ) {
+        let alreadyActive = now < spaceSwitchUntil
+        if !alreadyActive {
+            // Arm a fresh freeze window. Do NOT keep pushing the deadline every
+            // frame — dual-monitor CGWindow jitter was permanently parking snow.
             spaceTransitionStartedAt = now
+            spaceSwitchUntil = now + hold
+            spaceDumpLockUntil = now + hold + 1.8
+        } else if let screens, !screens.isEmpty {
+            // Mid-hold: only narrow / merge which displays are frozen.
+        } else {
+            return
         }
-        spaceSwitchUntil = max(spaceSwitchUntil, now + hold)
-        spaceDumpLockUntil = max(spaceDumpLockUntil, now + hold + 1.8)
         isSpaceTransitioning = true
         spaceTransitionRemaining = max(0, spaceSwitchUntil - now)
+        if let screens, !screens.isEmpty {
+            let freezingAll = spaceFrozenScreens.isEmpty
+                || spaceFrozenScreens.count >= max(1, screenRects.count)
+            if freezingAll {
+                // Narrow a blanket freeze (from Space notification) to the display
+                // whose windows actually slid — keep the other monitor alive.
+                spaceFrozenScreens = screens
+            } else {
+                for s in screens {
+                    if !spaceFrozenScreens.contains(where: {
+                        abs($0.minX - s.minX) < 2 && abs($0.maxX - s.maxX) < 2
+                            && abs($0.minY - s.minY) < 2 && abs($0.maxY - s.maxY) < 2
+                    }) {
+                        spaceFrozenScreens.append(s)
+                    }
+                }
+            }
+        } else if spaceFrozenScreens.isEmpty {
+            // Unknown which display — freeze all until syncSurfaces narrows it.
+            spaceFrozenScreens = screenRects.map {
+                (minX: $0.minX, maxX: $0.maxX, minY: $0.minY, maxY: $0.maxY)
+            }
+        }
         // Sliding Space frames must never become window-drag velocities.
         prevWindowPose.removeAll(keepingCapacity: true)
     }
@@ -714,9 +795,40 @@ final class SnowSimulator {
             // Quietly drop side-wall scrapings once — no live teleport (that jittered snowfall).
             removeSnowPillars()
             prevWindowPose.removeAll(keepingCapacity: true)
+            spaceFrozenScreens.removeAll(keepingCapacity: true)
         }
         wasSpaceTransitioning = active
         isSpaceTransitioning = active
+        if !active {
+            spaceFrozenScreens.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// True when this display is mid Space-swipe (neighbor monitors stay live).
+    func isSpaceTransitioning(on screenFrame: NSRect) -> Bool {
+        guard isSpaceTransitioning else { return false }
+        if spaceFrozenScreens.isEmpty { return true }
+        let minX = Float(screenFrame.minX)
+        let maxX = Float(screenFrame.maxX)
+        let minY = Float(screenFrame.minY)
+        let maxY = Float(screenFrame.maxY)
+        return spaceFrozenScreens.contains {
+            abs($0.minX - minX) < 4
+                && abs($0.maxX - maxX) < 4
+                && abs($0.minY - minY) < 4
+                && abs($0.maxY - maxY) < 4
+        }
+    }
+
+    private func isOnSpaceFrozenScreen(x: Float, y: Float) -> Bool {
+        guard isSpaceTransitioning, !spaceFrozenScreens.isEmpty else {
+            return isSpaceTransitioning
+        }
+        guard let host = owningScreen(x: x, y: y) else { return false }
+        return spaceFrozenScreens.contains {
+            abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
+                && abs($0.minY - host.minY) < 2 && abs($0.maxY - host.maxY) < 2
+        }
     }
 
     /// Delete flakes stuck in a thin vertical column (Space-swipe side scrape). Once only.
@@ -783,22 +895,49 @@ final class SnowSimulator {
     }
 
     private func refreshSnowBlockedScreens() {
-        // Only the display that actually hosts a maximized / fullscreen window.
-        // Never blank a neighbor monitor when the other one is zoomed.
-        var blocked: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
+        // Only true maximized / fullscreen windows. A large but normal window
+        // (e.g. 80% of the display) must NEVER blank the whole screen — that
+        // looked like snow "freezing" on a non-fullscreen desktop.
+        var live: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
         for win in occluders where win.isMaximized && !win.isDock {
             guard let host = hostScreen(of: win) else { continue }
-            let screenH = max(1, host.maxY - host.minY)
-            let screenW = max(1, host.maxX - host.minX)
-            let screenArea = screenW * screenH
+            let screenArea = max(1, (host.maxX - host.minX) * (host.maxY - host.minY))
             let overlapX = max(0, min(win.right, host.maxX) - max(win.x, host.minX))
             let overlapY = max(0, min(win.y, host.maxY) - max(win.bottom, host.minY))
             guard (overlapX * overlapY) / screenArea > 0.55 else { continue }
-            if !blocked.contains(where: {
+            if !live.contains(where: {
                 abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
             }) {
-                blocked.append(host)
+                live.append(host)
             }
+        }
+        let now = CACurrentMediaTime()
+        let hadLive = !liveBlockedScreens.isEmpty
+        liveBlockedScreens = live
+        if !live.isEmpty {
+            stickyBlockedScreens = live
+            // Do not keep pushing sticky while maximized is present — only arm
+            // when it disappears (below), otherwise a false positive never ends.
+        } else if hadLive {
+            // Maximized just left the list (Cmd+Tab / Space) — brief overlay hold.
+            snowBlockedStickyUntil = now + snowBlockedHold
+        } else if now >= snowBlockedStickyUntil {
+            stickyBlockedScreens.removeAll(keepingCapacity: true)
+        }
+        let sticky: [(minX: Float, maxX: Float, minY: Float, maxY: Float)]
+        if now < snowBlockedStickyUntil {
+            sticky = stickyBlockedScreens
+        } else {
+            sticky = []
+            stickyBlockedScreens.removeAll(keepingCapacity: true)
+        }
+        let blocked = mergeBlocked(live, sticky: sticky)
+        if blocked.count != snowBlockedScreens.count
+            || zip(blocked, snowBlockedScreens).contains(where: {
+                abs($0.0.minX - $0.1.minX) > 2 || abs($0.0.maxX - $0.1.maxX) > 2
+            })
+        {
+            markDriftDirty()
         }
         snowBlockedScreens = blocked
     }
@@ -843,11 +982,10 @@ final class SnowSimulator {
     }
 
     private func isOnBlockedScreen(x: Float, y: Float) -> Bool {
-        // Resolve the owning display first. Screens stacked vertically share an edge;
-        // a pad/overlap test would let a fullscreen upper monitor blank the lower one
-        // (spawns start just above the lower maxY, i.e. inside the upper frame).
+        // Physics / spawn: only LIVE maximized. Sticky overlay blank must not park
+        // flakes on a normal desktop (that froze snowfall after focus changes).
         guard let host = owningScreen(x: x, y: y) else { return false }
-        return snowBlockedScreens.contains {
+        return liveBlockedScreens.contains {
             abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
                 && abs($0.minY - host.minY) < 2 && abs($0.maxY - host.maxY) < 2
         }
@@ -1181,24 +1319,18 @@ final class SnowSimulator {
         syncSurfaces(with: ledges)
         refreshSpaceTransitionFlag()
 
-        if isSpaceTransitioning {
-            // Park mid-air flakes + piles; LAN hits still tick. Overlay hides separately.
-            updateLanImpacts(dt: dtClamped)
-            wasMouseDown = mouseDown
-            // Do not record Space-slide poses — they create a flake pillar on unfreeze.
-            prevWindowPose.removeAll(keepingCapacity: true)
-            buildUploadBuffers()
-            return
-        }
-
         purgeMaximizedSurfaces(from: windows)
         updateWind(dt: dtClamped)
         let liveLedges = activeLedges(from: ledges)
         let now = CACurrentMediaTime()
         let dumpLocked = now < spaceDumpLockUntil
         // After a Space swipe, ignore moving-window shoves / side walls until frames settle.
+        // Neighbor monitors (not in spaceFrozenScreens) keep full physics.
         if !dumpLocked {
             applyMovingWindowForces(dt: dtClamped)
+        } else if isSpaceTransitioning {
+            // Don't let sliding Space chrome imprint drag velocities.
+            prevWindowPose.removeAll(keepingCapacity: true)
         }
         spawn(dt: dtClamped)
         integrate(
@@ -1217,7 +1349,9 @@ final class SnowSimulator {
         settleActiveDrifts()
         updateLanImpacts(dt: dtClamped)
         wasMouseDown = mouseDown
-        rememberWindowPoses()
+        if !dumpLocked {
+            rememberWindowPoses()
+        }
         buildUploadBuffers()
     }
 
@@ -1245,6 +1379,9 @@ final class SnowSimulator {
 
     /// Drop any pile that landed on a maximized / near-fullscreen chrome (common after a
     /// Space swipe while frames are still sliding and `isMaximized` briefly flickers).
+    ///
+    /// IMPORTANT: never purge because `isOnBlockedScreen` / sticky blank is set — that only
+    /// hides the overlay. Sticky blank after Space swipe was wiping drifts + snowmen.
     private func purgeMaximizedSurfaces(from windows: [SnowWindow]) {
         var dirty = false
         for win in windows where win.isMaximized && !win.isDock {
@@ -1259,20 +1396,15 @@ final class SnowSimulator {
         }
         for (id, surface) in surfaces {
             if surface.ledge.isDock { continue }
-            if isScreenSpanningTopLedge(surface.ledge)
-                || isOnBlockedScreen(
-                    x: surface.ledge.x + surface.ledge.width * 0.5,
-                    y: surface.ledge.y
-                )
-            {
-                surfaces.removeValue(forKey: id)
-                surfaceMissingSince.removeValue(forKey: id)
-                restoreGuardUntil.removeValue(forKey: id)
-                dumpCooldownUntil.removeValue(forKey: id)
-                noSettleUntil.removeValue(forKey: id)
-                activeSurfaceIDs.remove(id)
-                dirty = true
-            }
+            // Only the ledge geometry itself — not overlay blanking.
+            guard isScreenSpanningTopLedge(surface.ledge) else { continue }
+            surfaces.removeValue(forKey: id)
+            surfaceMissingSince.removeValue(forKey: id)
+            restoreGuardUntil.removeValue(forKey: id)
+            dumpCooldownUntil.removeValue(forKey: id)
+            noSettleUntil.removeValue(forKey: id)
+            activeSurfaceIDs.remove(id)
+            dirty = true
         }
         if dirty { markDriftDirty() }
     }
@@ -1947,22 +2079,54 @@ final class SnowSimulator {
         var jumpCount = 0
         var slideCount = 0
         var movedCount = 0
+        var affectedScreens: [(minX: Float, maxX: Float, minY: Float, maxY: Float)] = []
+        func noteScreen(for ledge: SnowLedge) {
+            guard let host = owningScreen(x: ledge.x + ledge.width * 0.5, y: ledge.y - 8)
+            else { return }
+            if !affectedScreens.contains(where: {
+                abs($0.minX - host.minX) < 2 && abs($0.maxX - host.maxX) < 2
+            }) {
+                affectedScreens.append(host)
+            }
+        }
         for ledge in ledges {
             guard let prev = surfaces[ledge.id]?.ledge, !prev.isDock else { continue }
             let dx = abs(ledge.x - prev.x)
             let dy = abs(ledge.y - prev.y)
             let dist = hypot(dx, dy)
-            if dist >= spaceJumpThreshold { jumpCount += 1 }
-            if dist > 4, dx > dy * 1.15 { slideCount += 1 }
-            if dist > 2.0 || abs(ledge.width - prev.width) > 4 { movedCount += 1 }
+            var hit = false
+            if dist >= spaceJumpThreshold {
+                jumpCount += 1
+                hit = true
+            }
+            if dist > 4, dx > dy * 1.15 {
+                slideCount += 1
+                hit = true
+            }
+            if dist > 2.0 || abs(ledge.width - prev.width) > 4 {
+                movedCount += 1
+                hit = true
+            }
+            if hit { noteScreen(for: ledge) }
         }
         // Many windows vanish at once = leaving a Space mid-swipe.
         var missingCount = 0
         for (id, surface) in surfaces where !surface.ledge.isDock && surfaceMissingSince[id] == nil {
-            if !ledges.contains(where: { $0.id == id }) { missingCount += 1 }
+            if !ledges.contains(where: { $0.id == id }) {
+                missingCount += 1
+                noteScreen(for: surface.ledge)
+            }
         }
-        if jumpCount >= 2 || slideCount >= 2 || movedCount >= 3 || missingCount >= 2 {
-            beginSpaceTransition(now: now, hold: 0.85)
+        // Dual-monitor: require a clear multi-window slide. Plain window switching
+        // on one display must not freeze the neighbor.
+        if jumpCount >= 2 || slideCount >= 2 || missingCount >= 2
+            || (movedCount >= 4 && jumpCount + slideCount >= 1)
+        {
+            beginSpaceTransition(
+                now: now,
+                hold: 0.85,
+                screens: affectedScreens.isEmpty ? nil : affectedScreens
+            )
         }
 
         let inSpaceCooldown = now < spaceSwitchUntil
@@ -2091,6 +2255,15 @@ final class SnowSimulator {
         guard let bestID, var stolen = surfaces.removeValue(forKey: bestID) else { return nil }
         surfaceMissingSince.removeValue(forKey: bestID)
         restoreGuardUntil.removeValue(forKey: bestID)
+        // Window id often changes across Spaces — keep props glued to the pile.
+        if bestID != ledge.id {
+            for i in snowmen.indices where snowmen[i].restingLedge == bestID {
+                snowmen[i].restingLedge = ledge.id
+            }
+            for i in balls.indices where balls[i].restingLedge == bestID {
+                balls[i].restingLedge = ledge.id
+            }
+        }
         stolen.resize(to: ledge, cellWidth: cellWidth)
         return stolen
     }
@@ -2148,10 +2321,18 @@ final class SnowSimulator {
         // Independent quota per monitor — main display must never be starved.
         let perPoint: Float = 0.07 * intensity
         for screen in screens {
-            // No snow on monitors covered by a fullscreen / maximized window.
-            if snowBlockedScreens.contains(where: {
+            // No snow on monitors with a live maximized window (not sticky overlay blank).
+            if liveBlockedScreens.contains(where: {
                 abs($0.minX - screen.minX) < 2 && abs($0.maxX - screen.maxX) < 2
             }) {
+                continue
+            }
+            // Mid Space-swipe on this display only — neighbor screens still spawn.
+            if isSpaceTransitioning,
+                spaceFrozenScreens.contains(where: {
+                    abs($0.minX - screen.minX) < 2 && abs($0.maxX - screen.maxX) < 2
+                })
+            {
                 continue
             }
             // If another display sits above this one, spawning above maxY lands
@@ -2214,7 +2395,8 @@ final class SnowSimulator {
             var p = particles[i]
             // Fullscreen / maximized Space: park flakes in place — never delete them.
             // Deleting here made snow "restart from the top" after swiping back.
-            if isOnBlockedScreen(x: p.x, y: p.y) {
+            // Same park while this display's Space is sliding (neighbor keeps falling).
+            if isOnBlockedScreen(x: p.x, y: p.y) || isOnSpaceFrozenScreen(x: p.x, y: p.y) {
                 particles[write] = p
                 write += 1
                 continue
@@ -2368,9 +2550,16 @@ final class SnowSimulator {
         return false
     }
 
-    /// Fullscreen / maximized app content — balls must never linger here.
+    /// True maximized / fullscreen window body — destroys balls/snowmen that fall in.
+    /// Uses live window geometry only (NOT sticky overlay blanking). Sticky blank after
+    /// a Space swipe must park/hide snow, not melt snowmen and drifts.
     private func isInsideMaximized(x: Float, y: Float) -> Bool {
-        isOnBlockedScreen(x: x, y: y)
+        for win in occluders where win.isMaximized && !win.isDock {
+            if x >= win.x, x <= win.right, y <= win.y, y >= win.bottom {
+                return true
+            }
+        }
+        return false
     }
 
     /// Screen where most of the window's area actually sits (not merely `.first` hit).
@@ -3237,6 +3426,8 @@ final class SnowSimulator {
     private func updateBalls(dt: Float, ledges: [SnowLedge]) {
         let sorted = ledges.sorted { $0.y > $1.y }
         let ledgeByID = Dictionary(uniqueKeysWithValues: sorted.map { ($0.id, $0) })
+        let now = CACurrentMediaTime()
+        let spaceLock = isSpaceTransitioning || now < spaceSwitchUntil
 
         // Pass 1: free roots only (stacked children follow in pass 2).
         for i in balls.indices {
@@ -3247,11 +3438,28 @@ final class SnowSimulator {
             if isParkedOnOtherSpace(restingLedge: balls[i].restingLedge) {
                 balls[i].vx = 0
                 balls[i].vy = 0
+                if let lid = balls[i].restingLedge, let surface = surfaces[lid] {
+                    let ledge = surface.ledge
+                    let pile = surface.height(atLocalX: balls[i].x - ledge.x)
+                    balls[i].y = ballGroundY(ledgeY: ledge.y, pile: pile, radius: balls[i].radius)
+                }
                 continue
             }
-            // Ledge was destroyed — drop.
+            // Ledge briefly gone mid-swipe — keep id for reclaim, don't freefall.
             if let lid = balls[i].restingLedge, surfaces[lid] == nil {
-                balls[i].restingLedge = nil
+                balls[i].vx = 0
+                balls[i].vy = 0
+                continue
+            }
+            if spaceLock, balls[i].restingLedge != nil {
+                balls[i].vx = 0
+                balls[i].vy = 0
+                if let lid = balls[i].restingLedge, let surface = surfaces[lid] {
+                    let ledge = surface.ledge
+                    let pile = surface.height(atLocalX: balls[i].x - ledge.x)
+                    balls[i].y = ballGroundY(ledgeY: ledge.y, pile: pile, radius: balls[i].radius)
+                }
+                continue
             }
 
             let supportsStack = ballSupportsStack(i)
@@ -3583,20 +3791,44 @@ final class SnowSimulator {
         snowmanThrowOrigin[idx] = SIMD2(s.poseMid.x, s.poseMid.y)
     }
 
+    /// Keep a snowman glued to its pile (Space swipe / off-Space park).
+    private func snapSnowmanToRestingLedge(_ i: Int) {
+        snowmen[i].vx = 0
+        snowmen[i].vy = 0
+        guard let lid = snowmen[i].restingLedge, let surface = surfaces[lid] else { return }
+        let ledge = surface.ledge
+        let pad = snowmen[i].baseR
+        snowmen[i].x = max(ledge.x + pad, min(ledge.x + ledge.width - pad, snowmen[i].x))
+        let pile = surface.height(atLocalX: snowmen[i].x - ledge.x)
+        snowmen[i].y = ballGroundY(ledgeY: ledge.y, pile: pile, radius: snowmen[i].baseR)
+    }
+
     private func updateSnowmen(dt: Float, ledges: [SnowLedge]) {
         let sorted = ledges.sorted { $0.y > $1.y }
+        let now = CACurrentMediaTime()
+        // During Space swipe windows slide / vanish — freefall would melt the snowman.
+        let spaceLock = isSpaceTransitioning || now < spaceSwitchUntil
         for i in snowmen.indices {
             if snowmen[i].held { continue }
 
             if isParkedOnOtherSpace(restingLedge: snowmen[i].restingLedge) {
+                snapSnowmanToRestingLedge(i)
+                continue
+            }
+            // Surface briefly missing mid-swipe: keep the ledge id for reclaim, don't drop.
+            if let lid = snowmen[i].restingLedge, surfaces[lid] == nil {
                 snowmen[i].vx = 0
                 snowmen[i].vy = 0
                 continue
             }
-            if let lid = snowmen[i].restingLedge, surfaces[lid] == nil {
-                snowmen[i].restingLedge = nil
+            if spaceLock {
+                snapSnowmanToRestingLedge(i)
+                continue
             }
-            if isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y) {
+            // Only melt when freefalling into true maximized chrome — never while seated.
+            if snowmen[i].restingLedge == nil,
+               isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y)
+            {
                 snowmen[i].baseMass = 0
                 continue
             }
@@ -3617,7 +3849,10 @@ final class SnowSimulator {
                 snowmen[i].x += snowmen[i].vx * stepDt
                 snowmen[i].y += snowmen[i].vy * stepDt
 
-                if !handoffFlight, isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y) {
+                if !handoffFlight,
+                   snowmen[i].restingLedge == nil,
+                   isInsideMaximized(x: snowmen[i].x, y: snowmen[i].y)
+                {
                     snowmen[i].baseMass = 0
                     rested = true
                     break
@@ -3628,7 +3863,7 @@ final class SnowSimulator {
 
                 if !handoffFlight {
                     for ledge in sorted {
-                        if CACurrentMediaTime() < (noSettleUntil[ledge.id] ?? 0) { continue }
+                        if now < (noSettleUntil[ledge.id] ?? 0) { continue }
                         let pad = snowmen[i].baseR * 0.35
                         guard snowmen[i].x >= ledge.x - pad, snowmen[i].x <= ledge.x + ledge.width + pad else { continue }
                         let pile = surfaces[ledge.id]?.height(atLocalX: snowmen[i].x - ledge.x) ?? 0
@@ -3683,7 +3918,10 @@ final class SnowSimulator {
                     }
                 }
             }
-            if !rested { snowmen[i].restingLedge = nil }
+            // Don't clear the seat on a failed settle frame — Space jitter looked like a fall.
+            if !rested, hypot(snowmen[i].vx, snowmen[i].vy) > 40 {
+                snowmen[i].restingLedge = nil
+            }
 
             // Slide off the ends of a ledge while resting.
             if let lid = snowmen[i].restingLedge,
