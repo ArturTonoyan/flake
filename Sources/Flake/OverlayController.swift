@@ -4,6 +4,11 @@ import MetalKit
 import QuartzCore
 
 final class OverlayController {
+    /// Just under pop-up menus so Flake's status menu (and system menus) stay readable.
+    private static let snowOverlayLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 1
+    )
+
     private struct ScreenOverlay {
         let panel: NSPanel
         let view: MTKView
@@ -30,6 +35,10 @@ final class OverlayController {
     var onLanPeersChanged: (() -> Void)?
     private let toast = LanToastBanner()
     private let snowmanPoster = InboundSnowmanPoster()
+    /// Smooth overlay opacity during Space swipe / maximized blanking (0…1).
+    private var overlayFade: CGFloat = 1
+    /// Status-item / app menu is open — keep snow from covering it.
+    var menuOccludesSnow = false
 
     var isPaused = false
 
@@ -149,6 +158,17 @@ final class OverlayController {
             fromName: giant ? "гигант" : "тест"
         )
         toast.show(giant ? "Огромный снежок (тест)" : "Снежок от тест")
+    }
+
+    /// Drop a local snowman on a window ledge so throw animation can be checked.
+    func spawnTestSnowman() {
+        let mouse = NSEvent.mouseLocation
+        _ = simulator.spawnTestSnowman(
+            nearX: Float(mouse.x),
+            nearY: Float(mouse.y),
+            signText: ""
+        )
+        toast.show("Снеговик на окне")
     }
 
     /// Local preview of a signed snowman flying in (stays until click).
@@ -299,9 +319,9 @@ final class OverlayController {
             )
             // Force the panel onto this exact display (multi-monitor critical).
             panel.setFrame(frame, display: true)
-            // Above Dock/windows so drifts sit on chrome, but below menu bar & pop-up
-            // menus (screenSaver level drew snow on top of the status-item settings).
-            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
+            // Above normal / floating app windows and the Dock, but below status-item
+            // menus and system pop-ups (draggingWindow sits far above those).
+            panel.level = Self.snowOverlayLevel
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
@@ -437,7 +457,8 @@ final class OverlayController {
 
         if !isPaused {
             updateWorldBounds()
-            simulator.update(dt: dt, windows: tracker.windows(active: trackingActive))
+            // Force a fresh window scan while dragging so drifts stick to the title bar.
+            simulator.update(dt: dt, windows: tracker.windows(force: pressed, active: trackingActive))
             if lanSnowballsEnabled {
                 for exit in simulator.consumeEdgeExits() {
                     peerNetwork.sendSnowball(exit)
@@ -453,29 +474,53 @@ final class OverlayController {
 
         let signEntries = simulator.snowmenSignHUD()
         let hasLanHits = simulator.hasActiveLanImpacts
+        // Keep snow through the start of the swipe; start revealing before freeze ends.
+        let concealSpace =
+            simulator.isSpaceTransitioning
+            && simulator.spaceTransitionAge > 0.28
+            && simulator.spaceTransitionRemaining > 0.38
+        let spaceTarget: CGFloat = concealSpace ? 0 : 1
+        let spaceSpeed: CGFloat = spaceTarget < overlayFade ? 2.6 : 5.8
+        let spaceStep = min(1 as CGFloat, max(0, CGFloat(dt)) * spaceSpeed)
+        overlayFade += (spaceTarget - overlayFade) * spaceStep
+        if abs(overlayFade - spaceTarget) < 0.012 { overlayFade = spaceTarget }
+
         for item in overlays {
             item.signHUD.sync(entries: signEntries, panel: item.panel)
-            // Maximized / fullscreen → hide regular snow, but keep the panel up for peer hits
-            // so the splat reads on top of (and "inside") any window / fullscreen app.
+            // Maximized / fullscreen → hide regular snow, but keep the panel up for peer hits.
+            // Space swipe: screen-fixed overlay fades instead of hard-cutting.
             let blocked = simulator.isSnowBlocked(screenFrame: item.renderer.screenFrame)
             let showLan = hasLanHits && simulator.hasLanImpacts(in: item.renderer.screenFrame)
-            if blocked && !showLan {
-                if item.panel.alphaValue != 0 {
-                    item.panel.alphaValue = 0
+            let want: CGFloat
+            if menuOccludesSnow && !showLan {
+                // Hard-hide while our settings menu is open (level alone isn't enough —
+                // orderFrontRegardless can still paint over the status-item menu).
+                want = 0
+            } else if showLan {
+                want = 1
+            } else if blocked {
+                want = 0
+            } else {
+                want = overlayFade
+            }
+            let cur = item.panel.alphaValue
+            let panelSpeed: CGFloat = want < cur ? 8.0 : 6.0
+            let panelStep = min(1 as CGFloat, max(0, CGFloat(dt)) * panelSpeed)
+            let alpha = abs(want - cur) < 0.012 ? want : cur + (want - cur) * panelStep
+            if item.panel.alphaValue != alpha {
+                item.panel.alphaValue = alpha
+            }
+            if alpha < 0.02 && !showLan {
+                if menuOccludesSnow {
+                    item.panel.orderBack(nil)
                 }
                 continue
             }
-            if item.panel.alphaValue != 1 {
-                item.panel.alphaValue = 1
+            // Keep a stable level under menus; LAN hits use the same stack (still over apps).
+            if item.panel.level != Self.snowOverlayLevel {
+                item.panel.level = Self.snowOverlayLevel
             }
-            // Lift above fullscreen apps while a hit is visible (still below the menu bar popovers).
-            let wantLevel = showLan
-                ? NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 1)
-                : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
-            if item.panel.level != wantLevel {
-                item.panel.level = wantLevel
-            }
-            if showLan || item.panel.isVisible {
+            if !menuOccludesSnow, showLan || item.panel.isVisible || alpha > 0.02 {
                 item.panel.orderFrontRegardless()
             }
             item.renderer.render(into: item.view, lanOnly: blocked && showLan)

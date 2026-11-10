@@ -6,6 +6,8 @@
 	<string>com.flake.snow</string>
 	<key>CFBundleName</key>
 	<string>Flake</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleExecutable</key>
 	<string>Flake</string>
 	<key>CFBundlePackageType</key>

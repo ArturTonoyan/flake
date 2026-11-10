@@ -1,11 +1,12 @@
 import AppKit
 
-final class StatusBarController {
+final class StatusBarController: NSObject, NSMenuDelegate {
     private let overlay: OverlayController
     private var item: NSStatusItem?
 
     init(overlay: OverlayController) {
         self.overlay = overlay
+        super.init()
         overlay.onLanPeersChanged = { [weak self] in
             self?.refreshMenu()
         }
@@ -24,8 +25,17 @@ final class StatusBarController {
         self.item = item
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        overlay.menuOccludesSnow = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        overlay.menuOccludesSnow = false
+    }
+
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
 
         let pause = NSMenuItem(
             title: overlay.isPaused ? "Продолжить снег" : "Пауза",
@@ -65,6 +75,14 @@ final class StatusBarController {
         let clear = NSMenuItem(title: "Растаять всё", action: #selector(clearSnow), keyEquivalent: "r")
         clear.target = self
         menu.addItem(clear)
+
+        let spawnSnowman = NSMenuItem(
+            title: "Снеговик (тест)",
+            action: #selector(spawnTestSnowman),
+            keyEquivalent: "s"
+        )
+        spawnSnowman.target = self
+        menu.addItem(spawnSnowman)
 
         let tip = NSMenuItem(
             title: "3 шара → снеговик; ПКМ → табличка",
@@ -257,6 +275,10 @@ final class StatusBarController {
 
     @objc private func previewSnowmanHit() {
         overlay.previewLanSnowmanHit()
+    }
+
+    @objc private func spawnTestSnowman() {
+        overlay.spawnTestSnowman()
     }
 
     @objc private func setPeerSide(_ sender: NSMenuItem) {

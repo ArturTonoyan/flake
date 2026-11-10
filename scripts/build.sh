@@ -26,9 +26,10 @@ lipo -create .build/Flake-arm64 .build/Flake-x86_64 -output .build/Flake
 
 APP="$ROOT/Flake.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/Flake "$APP/Contents/MacOS/Flake"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 chmod +x "$APP/Contents/MacOS/Flake"
 xattr -cr "$APP" 2>/dev/null || true

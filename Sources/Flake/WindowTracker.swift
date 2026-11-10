@@ -3,6 +3,9 @@ import CoreGraphics
 
 /// Full window rectangle in global Cocoa points (y grows up; `y` is the TOP edge).
 struct SnowWindow: Equatable {
+    /// Visual / collision radius for top rounded chrome (points).
+    static let cornerRadius: Float = 12
+
     let id: UInt32
     let x: Float
     let y: Float
@@ -21,10 +24,45 @@ struct SnowWindow: Equatable {
         SnowLedge(id: id, x: x, y: y, width: width, z: z, isDock: isDock)
     }
 
+    /// Solid left edge at this Y (insets along the top-left quarter-circle).
+    func solidLeft(atY py: Float) -> Float {
+        let r = Self.cornerRadius
+        guard !isDock, !isMaximized, r > 1, width > r * 2 else { return x }
+        let top = y - 1
+        guard py > top - r, py <= top + 0.5 else { return x }
+        let cy = top - r
+        let dy = min(r, max(0, py - cy))
+        let under = max(0, r * r - dy * dy)
+        return (x + r) - sqrtf(under)
+    }
+
+    /// Solid right edge at this Y (insets along the top-right quarter-circle).
+    func solidRight(atY py: Float) -> Float {
+        let r = Self.cornerRadius
+        guard !isDock, !isMaximized, r > 1, width > r * 2 else { return right }
+        let top = y - 1
+        guard py > top - r, py <= top + 0.5 else { return right }
+        let cy = top - r
+        let dy = min(r, max(0, py - cy))
+        let under = max(0, r * r - dy * dy)
+        return (right - r) + sqrtf(under)
+    }
+
     /// True if point is inside the window body (not on/above the top edge).
+    /// Top corners follow the rounded chrome so flakes don't hit an invisible square wall.
     func occludes(x px: Float, y py: Float) -> Bool {
-        guard px >= x, px <= right else { return false }
-        return py < y - 1 && py >= bottom
+        guard py < y - 1, py >= bottom else { return false }
+        let left = solidLeft(atY: py)
+        let rightEdge = solidRight(atY: py)
+        return px >= left && px <= rightEdge
+    }
+
+    /// Point sits in the cutaway of a top-left / top-right rounded corner.
+    func isOutsideTopRoundedCorner(px: Float, py: Float) -> Bool {
+        guard !isDock, !isMaximized else { return false }
+        let top = y - 1
+        guard py < top, py >= bottom else { return false }
+        return px < solidLeft(atY: py) || px > solidRight(atY: py)
     }
 }
 
@@ -42,7 +80,7 @@ final class WindowTracker {
     private var lastUpdate: CFTimeInterval = 0
     /// Idle desktops don't need 30Hz window scans — bump while the user moves things.
     private let idleInterval: CFTimeInterval = 1.0 / 12.0
-    private let activeInterval: CFTimeInterval = 1.0 / 30.0
+    private let activeInterval: CFTimeInterval = 1.0 / 60.0
     private let ourPID = ProcessInfo.processInfo.processIdentifier
 
     /// Pass `active: true` while the mouse moves / drags so ledge tracking stays snappy.
@@ -79,12 +117,17 @@ final class WindowTracker {
 
         var raw: [SnowWindow] = []
         raw.reserveCapacity(32)
+        /// Floating / utility / modal panels (layer > 0): occlude flakes, never grow drifts.
+        var elevatedIDs: Set<UInt32> = []
+        // Real Dock chrome bounds (Quartz→Cocoa) — used to size the synthetic ledge.
+        var measuredDocks: [(x: Float, topY: Float, width: Float, height: Float)] = []
 
         for (index, window) in info.enumerated() {
             guard
                 let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t,
                 ownerPID != ourPID,
                 let layer = window[kCGWindowLayer as String] as? Int,
+                // Up through status chrome. Pop-up menus sit higher; overlay is below them.
                 layer <= 25,
                 let boundsDict = window[kCGWindowBounds as String] as? [String: CGFloat],
                 let alpha = window[kCGWindowAlpha as String] as? CGFloat,
@@ -95,8 +138,19 @@ final class WindowTracker {
             let owner = window[kCGWindowOwnerName as String] as? String ?? ""
             let windowName = window[kCGWindowName as String] as? String ?? ""
 
-            // Dock is handled via synthetic ledges from visibleFrame (more stable).
-            if owner == "Dock" || owner == "Dock Helper" { continue }
+            let x = Float(boundsDict["X"] ?? 0)
+            let yTopQuartz = Float(boundsDict["Y"] ?? 0)
+            let w = Float(boundsDict["Width"] ?? 0)
+            let h = Float(boundsDict["Height"] ?? 0)
+            let topY = primaryHeight - yTopQuartz
+
+            // Capture live Dock chrome. Ignore huge full-bleed Dock helpers.
+            if owner == "Dock" || owner == "Dock Helper" {
+                if w >= 120, w <= 1400, h >= 36, h <= 120, layer >= 0 {
+                    measuredDocks.append((x: x, topY: topY, width: w, height: h))
+                }
+                continue
+            }
 
             if owner == "Window Server"
                 || owner == "Control Center"
@@ -104,21 +158,19 @@ final class WindowTracker {
                 || owner == "SystemUIServer"
                 || owner == "Spotlight"
                 || owner == "TextInputMenuAgent"
+                || owner == "Wallpaper"
+                || owner == "WallpaperAgent"
+                || owner == "Dock Extra"
+                || owner == "ViewBridgeAuxiliary"
             {
                 continue
             }
+            // Near-invisible chrome still occludes flakes into a vertical wall — ignore it.
+            if alpha < 0.18 { continue }
 
             if isWidgetProcess(owner: owner) { continue }
-            if layer > 0 { continue }
-
-            let x = Float(boundsDict["X"] ?? 0)
-            let yTopQuartz = Float(boundsDict["Y"] ?? 0)
-            let w = Float(boundsDict["Width"] ?? 0)
-            let h = Float(boundsDict["Height"] ?? 0)
 
             if w < 48 || h < 28 { continue }
-
-            let topY = primaryHeight - yTopQuartz
 
             // Desktop widgets: ignore completely — no occlusion, no drifts (snow falls through).
             if isDesktopWidget(owner: owner, name: windowName, width: w, height: h) {
@@ -135,6 +187,9 @@ final class WindowTracker {
             }
 
             let maximized = isMaximizedWindow(x: x, topY: topY, width: w, height: h)
+            if layer > 0 {
+                elevatedIDs.insert(windowNumber)
+            }
 
             raw.append(
                 SnowWindow(
@@ -160,7 +215,16 @@ final class WindowTracker {
                     && win.bottom >= other.bottom - 2
                     && win.y <= other.y + 2
             }
-            let canAccumulate = !win.isMaximized && !nested && win.height >= 100 && win.width >= 220
+            // Near-fullscreen chrome must not collect snow, but must NOT flip
+            // `isMaximized` — that blanks the whole display and looked like a stuck pause.
+            let nearFullscreenShelf = isNearFullscreenShelf(win)
+            let canAccumulate =
+                !elevatedIDs.contains(win.id)
+                && !win.isMaximized
+                && !nearFullscreenShelf
+                && !nested
+                && win.height >= 100
+                && win.width >= 220
             return SnowWindow(
                 id: win.id,
                 x: win.x,
@@ -174,11 +238,14 @@ final class WindowTracker {
             )
         }
 
-        return appendDockLedges(onto: windows)
+        return appendDockLedges(onto: windows, measured: measuredDocks)
     }
 
-    /// Bottom Dock per display from visibleFrame — reliable across Spaces / magnification.
-    private func appendDockLedges(onto windows: [SnowWindow]) -> [SnowWindow] {
+    /// Bottom Dock per display. Prefer the real floating Dock pill bounds from CGWindowList.
+    private func appendDockLedges(
+        onto windows: [SnowWindow],
+        measured: [(x: Float, topY: Float, width: Float, height: Float)] = []
+    ) -> [SnowWindow] {
         var result = windows
         for (index, screen) in NSScreen.screens.enumerated() {
             let frame = screen.frame
@@ -186,19 +253,56 @@ final class WindowTracker {
             let bottomGap = visible.minY - frame.minY
             guard bottomGap >= 22, bottomGap <= 140 else { continue }
 
-            // Prefer the floating Dock width (centered); fall back to visible width.
-            let dockWidth = min(visible.width * 0.92, max(280, visible.width * 0.55))
-            let dockX = visible.midX - dockWidth * 0.5
             let id: UInt32 = 0xD0C00000 | UInt32(index & 0xFFFF)
+            let visibleTop = Float(visible.minY)
+            let screenW = Float(frame.width)
+
+            // Live Dock chrome on this display. Pick the narrowest plausible pill —
+            // widest CGWindow is often an invisible full-bleed Dock helper.
+            let candidates = measured.filter { dock in
+                let midX = dock.x + dock.width * 0.5
+                let onScreen = midX >= Float(frame.minX) - 4 && midX <= Float(frame.maxX) + 4
+                let nearBottom = abs(dock.topY - visibleTop) < 48
+                    || abs((dock.topY - dock.height) - Float(frame.minY)) < 28
+                let floating = dock.width >= 140 && dock.width <= screenW * 0.82
+                return onScreen && nearBottom && floating
+            }
+            let live = candidates.min { a, b in
+                // Prefer icon-row height (~50–80) and narrower width.
+                let score: ((x: Float, topY: Float, width: Float, height: Float)) -> Float = { d in
+                    let hPenalty = abs(d.height - 62) * 2
+                    return d.width + hPenalty
+                }
+                return score(a) < score(b)
+            }
+
+            let dockWidth: Float
+            let dockX: Float
+            let dockTop: Float
+            let dockHeight: Float
+            if let live {
+                // Real floating pill width/x; Y from visibleFrame (stable across Spaces).
+                dockWidth = live.width + 6
+                dockX = live.x - 3
+                dockTop = visibleTop
+                dockHeight = max(Float(bottomGap), min(live.height + 4, Float(bottomGap) + 20))
+            } else {
+                // Fallback: typical floating Dock is far narrower than the display.
+                dockWidth = min(screenW * 0.7, max(220, screenW * 0.38))
+                dockX = Float(visible.midX) - dockWidth * 0.5
+                dockTop = visibleTop
+                dockHeight = Float(bottomGap)
+            }
 
             result.append(
                 SnowWindow(
                     id: id,
-                    x: Float(dockX),
-                    y: Float(visible.minY),
-                    width: Float(dockWidth),
-                    height: Float(bottomGap),
-                    z: 50_000 + index,
+                    x: dockX,
+                    y: dockTop,
+                    width: dockWidth,
+                    height: dockHeight,
+                    // Dock draws above windows — keep it frontmost so flakes settle and drifts draw.
+                    z: -1_000 - index,
                     isDock: true,
                     isMaximized: false,
                     canAccumulate: true
@@ -318,6 +422,36 @@ final class WindowTracker {
                 && bottom <= full.minY + full.height * 0.12
 
             if coversVisible || coversFull || coversMost { return true }
+        }
+        return false
+    }
+
+    /// Wide window whose top edge sits in the menu-bar band — treat as zoomed so snow
+    /// cannot settle on the title bar (especially mid Space-swipe frame samples).
+    private func isNearFullscreenShelf(_ win: SnowWindow) -> Bool {
+        guard !win.isDock else { return false }
+        for screen in NSScreen.screens {
+            let full = screen.frame
+            let visible = screen.visibleFrame
+            let cx = CGFloat(win.x) + CGFloat(win.width) * 0.5
+            let cy = CGFloat(win.bottom) + CGFloat(win.height) * 0.5
+            guard full.contains(CGPoint(x: cx, y: cy)) || visible.contains(CGPoint(x: cx, y: cy))
+            else { continue }
+
+            let nearTop =
+                CGFloat(win.y) >= visible.maxY - 22
+                || CGFloat(win.y) >= full.maxY - 8
+            let wideEnough =
+                CGFloat(win.width) >= visible.width * 0.82
+                || CGFloat(win.width) >= full.width * 0.82
+            let tallEnough =
+                CGFloat(win.height) >= visible.height * 0.78
+                || CGFloat(win.height) >= full.height * 0.78
+            let aligned =
+                CGFloat(win.x) <= visible.minX + visible.width * 0.12
+            if nearTop && wideEnough && tallEnough && aligned {
+                return true
+            }
         }
         return false
     }
