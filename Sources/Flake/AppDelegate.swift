@@ -8,6 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay = OverlayController()
         overlay?.start()
 
+        if let overlay {
+            DuelArenaController.shared.configure(
+                network: overlay.peerNetwork,
+                peers: { overlay.lanPeers }
+            )
+        }
+
         statusBar = StatusBarController(overlay: overlay!)
         statusBar?.install()
     }

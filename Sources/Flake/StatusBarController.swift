@@ -84,6 +84,33 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         spawnSnowman.target = self
         menu.addItem(spawnSnowman)
 
+        let duel = NSMenuItem(
+            title: "Снежный бой",
+            action: #selector(openDuelArena),
+            keyEquivalent: "d"
+        )
+        duel.target = self
+        menu.addItem(duel)
+
+        let duelPeers = overlay.lanPeers.filter(\.isReachable)
+        if !duelPeers.isEmpty {
+            let challengeRoot = NSMenuItem(title: "Вызвать на бой", action: nil, keyEquivalent: "")
+            let challengeMenu = NSMenu()
+            for peer in duelPeers {
+                let short = OverlayController.shortPeerName(peer.name)
+                let item = NSMenuItem(
+                    title: short,
+                    action: #selector(challengePeer(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = peer
+                challengeMenu.addItem(item)
+            }
+            challengeRoot.submenu = challengeMenu
+            menu.addItem(challengeRoot)
+        }
+
         let tip = NSMenuItem(
             title: "3 шара → снеговик; ПКМ → табличка",
             action: nil,
@@ -279,6 +306,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func spawnTestSnowman() {
         overlay.spawnTestSnowman()
+    }
+
+    @objc private func openDuelArena() {
+        DuelArenaController.shared.openLobby()
+    }
+
+    @objc private func challengePeer(_ sender: NSMenuItem) {
+        guard let peer = sender.representedObject as? PeerInfo else { return }
+        overlay.lanSnowballsEnabled = true
+        DuelArenaController.shared.challengePeer(id: peer.id, name: peer.name)
     }
 
     @objc private func setPeerSide(_ sender: NSMenuItem) {

@@ -37,6 +37,7 @@ final class OverlayController {
     var onLanPeersChanged: (() -> Void)?
     private let toast = LanToastBanner()
     private let snowmanPoster = InboundSnowmanPoster()
+    private let signPrompt = SnowmanSignPrompt()
     /// Per-display overlay opacity during Space swipe (0…1). Dual monitors with
     /// separate Spaces must not fade the idle display when the other swipes.
     private var overlayFades: [CGDirectDisplayID: CGFloat] = [:]
@@ -276,31 +277,22 @@ final class OverlayController {
     }
 
     private func promptSnowmanSign(at index: Int) {
-        NSApp.activate(ignoringOtherApps: true)
-
-        let alert = NSAlert()
-        alert.messageText = "Табличка снеговика"
-        alert.informativeText = "Напиши текст на табличку. Потом кинь снеговика за край экрана — друг увидит надпись."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.stringValue = simulator.signText(at: index) ?? ""
-        field.placeholderString = "Например: Привет!"
-        field.maximumNumberOfLines = 1
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Готово")
-        alert.addButton(withTitle: "Убрать табличку")
-        alert.addButton(withTitle: "Отмена")
-        DispatchQueue.main.async { [weak self] in
+        guard !signPrompt.isPresented else { return }
+        let initial = simulator.signText(at: index) ?? ""
+        signPrompt.present(
+            initialText: initial,
+            maxCharacters: PeerSnowNetwork.maxSignCharacters
+        ) { [weak self] result in
             guard let self else { return }
-            let response = alert.runModal()
-            switch response {
-            case .alertFirstButtonReturn:
-                self.simulator.setSnowmanSign(at: index, text: field.stringValue)
-                if !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            switch result {
+            case .save(let text):
+                self.simulator.setSnowmanSign(at: index, text: text)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.toast.show("Табличка готова — кинь за край")
                 }
-            case .alertSecondButtonReturn:
+            case .clear:
                 self.simulator.setSnowmanSign(at: index, text: "")
-            default:
+            case .cancel:
                 break
             }
         }

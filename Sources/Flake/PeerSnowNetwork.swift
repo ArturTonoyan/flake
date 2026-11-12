@@ -93,6 +93,9 @@ final class PeerSnowNetwork {
     private static let typeGoodbye: UInt8 = 3
     private static let typeAck: UInt8 = 4
     private static let typeSnowman: UInt8 = 5
+    private static let typeDuel: UInt8 = 6
+    /// Duel payload packet: header + 6 floats + 2 score u16 + hmac.
+    private static let duelPacketSize = 64
     private static let maxSnowballsPerSecond = 12
     private static let deliveryTimeout: CFTimeInterval = 1.8
     private static let maxAbsVelocity: Float = 2_400
@@ -126,6 +129,8 @@ final class PeerSnowNetwork {
     var onThrowDelivered: ((String) -> Void)?
     /// No ACK within timeout — likely blocked / offline mid-flight.
     var onThrowMissed: ((String) -> Void)?
+    /// Snow duel lobby / sync events (main-thread callback).
+    var duelEventHandler: ((DuelNetEvent) -> Void)?
     /// Mirrored on the main thread for UI / simulator toggles.
     private(set) var isEnabledMain = false
 
@@ -204,6 +209,26 @@ final class PeerSnowNetwork {
     func restoreFromDefaults() {
         let on = UserDefaults.standard.bool(forKey: Self.defaultsKeyEnabled)
         setEnabled(on)
+    }
+
+    /// Send a duel control / sync packet to a peer.
+    func sendDuel(
+        toPeerID peerID: UInt64,
+        command: DuelNetCommand,
+        values: [Float] = [],
+        scoreA: UInt16 = 0,
+        scoreB: UInt16 = 0
+    ) {
+        queue.async { [weak self] in
+            guard let self, self.enabled, let peer = self.peers[peerID] else { return }
+            _ = self.sendDuelPacket(
+                to: peer,
+                command: command,
+                values: values,
+                scoreA: scoreA,
+                scoreB: scoreB
+            )
+        }
     }
 
     func setSide(_ side: PeerRelativeSide, forPeerID id: UInt64) {
@@ -699,7 +724,7 @@ final class PeerSnowNetwork {
                 }
                 guard let self, self.enabled, let content else { return }
                 let n = content.count
-                guard n == Self.packetSize || n == Self.snowmanPacketSize else { return }
+                guard n == Self.packetSize || n == Self.snowmanPacketSize || n == Self.duelPacketSize else { return }
                 self.handlePacket(content, on: connection, expectedPeerID: expectedPeerID)
             }
         }
@@ -707,7 +732,8 @@ final class PeerSnowNetwork {
 
     private func handlePacket(_ data: Data, on connection: NWConnection, expectedPeerID: UInt64?) {
         let isSnowmanPacket = data.count == Self.snowmanPacketSize
-        guard data.count == Self.packetSize || isSnowmanPacket else { return }
+        let isDuelPacket = data.count == Self.duelPacketSize
+        guard data.count == Self.packetSize || isSnowmanPacket || isDuelPacket else { return }
         let bytes = [UInt8](data)
         let magic = readUInt32(bytes, 0)
         guard magic == Self.magic, bytes[4] == Self.version else { return }
@@ -721,7 +747,14 @@ final class PeerSnowNetwork {
             return
         }
 
-        let bodyLen = isSnowmanPacket ? 104 : 40
+        let bodyLen: Int
+        if isSnowmanPacket {
+            bodyLen = 104
+        } else if isDuelPacket {
+            bodyLen = 56
+        } else {
+            bodyLen = 40
+        }
         let body = data.prefix(bodyLen)
         let tag = data.suffix(8)
         let key = sharedKey(localToken: localToken, peerToken: peer.token)
@@ -836,9 +869,74 @@ final class PeerSnowNetwork {
             peers[senderID]?.connection?.cancel()
             peers.removeValue(forKey: senderID)
             emitPeersChanged()
+        case Self.typeDuel:
+            guard isDuelPacket else { return }
+            guard allowInbound(from: senderID) else { return }
+            guard let command = DuelNetCommand(rawValue: bytes[24]) else { return }
+            var vals: [Float] = []
+            for i in 0..<6 {
+                vals.append(readFloat(bytes, 28 + i * 4))
+            }
+            let scoreA = readUInt16(bytes, 52)
+            let scoreB = readUInt16(bytes, 54)
+            let event = DuelNetEvent(
+                fromPeerID: senderID,
+                fromName: peer.name,
+                command: command,
+                values: vals,
+                scoreA: scoreA,
+                scoreB: scoreB
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.duelEventHandler?(event)
+            }
         default:
             break
         }
+    }
+
+    @discardableResult
+    private func sendDuelPacket(
+        to peer: PeerState,
+        command: DuelNetCommand,
+        values: [Float],
+        scoreA: UInt16,
+        scoreB: UInt16
+    ) -> UInt32? {
+        guard let connection = peers[peer.id]?.connection ?? {
+            ensureConnection(for: peer.id)
+            return peers[peer.id]?.connection
+        }() else { return nil }
+
+        let seq = UInt32.random(in: 1...UInt32.max)
+        var packet = Data(count: Self.duelPacketSize)
+        packet.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            writeUInt32(Self.magic, to: base)
+            base[4] = Self.version
+            base[5] = Self.typeDuel
+            writeUInt16(0, to: base + 6)
+            writeUInt64(localID, to: base + 8)
+            writeUInt32(seq, to: base + 16)
+            writeUInt32(UInt32(CACurrentMediaTime()), to: base + 20)
+            base[24] = command.rawValue
+            base[25] = 0
+            writeUInt16(0, to: base + 26)
+            for i in 0..<6 {
+                let v = i < values.count ? values[i] : Float(0)
+                writeFloat(v, to: base + 28 + i * 4)
+            }
+            writeUInt16(scoreA, to: base + 52)
+            writeUInt16(scoreB, to: base + 54)
+        }
+
+        let key = sharedKey(localToken: localToken, peerToken: peer.token)
+        let body = packet.prefix(56)
+        let mac = HMAC<SHA256>.authenticationCode(for: body, using: key)
+        let tag = Data(mac).prefix(8)
+        packet.replaceSubrange(56..<64, with: tag)
+        connection.send(content: packet, completion: .contentProcessed { _ in })
+        return seq
     }
 
     private func allowInbound(from id: UInt64) -> Bool {
