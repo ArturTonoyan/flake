@@ -30,6 +30,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/Flake "$APP/Contents/MacOS/Flake"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/Resources/snowplow-car.png" "$APP/Contents/Resources/snowplow-car.png"
+cp "$ROOT/Resources/snowplow-wheel.png" "$APP/Contents/Resources/snowplow-wheel.png"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 chmod +x "$APP/Contents/MacOS/Flake"
 xattr -cr "$APP" 2>/dev/null || true

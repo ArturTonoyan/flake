@@ -504,6 +504,38 @@ struct SettledSurface {
         return (taken, peak)
     }
 
+    /// Snowplow pass: scrape the pile. Default leaves a thin residual layer;
+    /// pass `keepFraction`/`minLayer` near 0 to strip the shelf clean.
+    mutating func plowLeaveThinLayer(
+        fromLocalX left: Float,
+        toLocalX right: Float,
+        keepFraction: Float = 0.18,
+        minLayer: Float = 1.6
+    ) -> (taken: Float, peak: Float) {
+        guard !heights.isEmpty, right > left else { return (0, 0) }
+        let lo = max(0, Int(floor(left / cellWidth)))
+        let hi = min(heights.count - 1, Int(ceil(right / cellWidth)))
+        let keep = max(0, min(0.45, keepFraction))
+        let floor = max(0, minLayer)
+        var taken: Float = 0
+        var peak: Float = 0
+        if lo <= hi {
+            for i in lo...hi {
+                let h = heights[i]
+                peak = max(peak, h)
+                let target = max(floor, h * keep)
+                let remove = max(0, h - target)
+                heights[i] = h - remove
+                taken += remove
+            }
+        }
+        if taken > 0.01 {
+            relax(iterations: 1)
+            taperEdges()
+        }
+        return (taken, peak)
+    }
+
     func maxHeight(inLocalX left: Float, toLocalX right: Float) -> Float {
         guard !heights.isEmpty, right > left else { return 0 }
         let lo = max(0, Int(floor(left / cellWidth)))
@@ -1191,6 +1223,145 @@ final class SnowSimulator {
             )
         )
         return true
+    }
+
+    /// Candidate ledge for the snowplow car (dock preferred when tall enough).
+    struct PlowTarget {
+        let id: UInt32
+        let ledge: SnowLedge
+        let peak: Float
+    }
+
+    /// Active Dock ledge for snowplow landing / resume, if any.
+    func findDockLedge() -> PlowTarget? {
+        for id in activeSurfaceIDs {
+            guard let surface = surfaces[id], surface.ledge.isDock else { continue }
+            let peak = surface.maxHeight(inLocalX: 0, toLocalX: surface.ledge.width)
+            return PlowTarget(id: id, ledge: surface.ledge, peak: peak)
+        }
+        for win in occluders where win.isDock && win.canAccumulate {
+            let ledge = win.ledge
+            let peak = surfaces[ledge.id]?.maxHeight(inLocalX: 0, toLocalX: ledge.width) ?? 0
+            return PlowTarget(id: ledge.id, ledge: ledge, peak: peak)
+        }
+        return nil
+    }
+
+    /// Tallest active drift above `minPeak`, preferring the Dock when close.
+    func findPlowTarget(minPeak: Float = 11) -> PlowTarget? {
+        var best: PlowTarget?
+        for id in activeSurfaceIDs {
+            guard let surface = surfaces[id] else { continue }
+            let peak = surface.maxHeight(inLocalX: 0, toLocalX: surface.ledge.width)
+            guard peak >= minPeak else { continue }
+            let candidate = PlowTarget(id: id, ledge: surface.ledge, peak: peak)
+            guard let current = best else {
+                best = candidate
+                continue
+            }
+            // Prefer Dock; otherwise taller / wider shelves win.
+            let dockBoost: Float = candidate.ledge.isDock ? 8 : 0
+            let curDock: Float = current.ledge.isDock ? 8 : 0
+            let score = peak + dockBoost + min(12, candidate.ledge.width * 0.004)
+            let curScore = current.peak + curDock + min(12, current.ledge.width * 0.004)
+            if score > curScore { best = candidate }
+        }
+        return best
+    }
+
+    /// Force a visible pile so the test plow has something to scrape.
+    @discardableResult
+    func preparePlowTestDrift(minPeak: Float = 14) -> PlowTarget? {
+        if let existing = findPlowTarget(minPeak: minPeak * 0.65) {
+            return existing
+        }
+        // Prefer Dock, else the widest active window ledge.
+        var chosenID: UInt32?
+        var chosenLedge: SnowLedge?
+        var bestWidth: Float = 0
+        for id in activeSurfaceIDs {
+            guard let surface = surfaces[id] else { continue }
+            if surface.ledge.isDock {
+                chosenID = id
+                chosenLedge = surface.ledge
+                break
+            }
+            if surface.ledge.width > bestWidth {
+                bestWidth = surface.ledge.width
+                chosenID = id
+                chosenLedge = surface.ledge
+            }
+        }
+        if chosenID == nil {
+            for win in occluders where win.canAccumulate {
+                let ledge = win.ledge
+                if ledge.isDock || ledge.width > bestWidth {
+                    bestWidth = ledge.width
+                    chosenID = ledge.id
+                    chosenLedge = ledge
+                    if ledge.isDock { break }
+                }
+            }
+        }
+        guard let id = chosenID, let ledge = chosenLedge else { return nil }
+        var surface = surfaces[id] ?? SettledSurface(ledge: ledge, heights: [], cellWidth: cellWidth)
+        if surface.heights.isEmpty {
+            surface.resize(to: ledge, cellWidth: cellWidth)
+        } else {
+            surface.resize(to: ledge, cellWidth: cellWidth)
+        }
+        let peak: Float = ledge.isDock ? 15 : 18
+        // Cover nearly the full ledge so the plow has snow from end to end.
+        let margin = max(10, min(28, ledge.width * 0.03))
+        let steps = max(12, Int(ledge.width / 14))
+        for s in 0..<steps {
+            let t = Float(s) / Float(max(steps - 1, 1))
+            let lx = margin + t * max(8, ledge.width - margin * 2)
+            let bump = peak * (0.62 + 0.38 * sinf(t * .pi))
+            surface.restoreMound(atLocalX: lx, peak: bump, radius: 28)
+        }
+        surfaces[id] = surface
+        activeSurfaceIDs.insert(id)
+        markDriftDirty()
+        let measured = surface.maxHeight(inLocalX: 0, toLocalX: ledge.width)
+        return PlowTarget(id: id, ledge: ledge, peak: measured)
+    }
+
+    /// Scrape under the plow blade in global Cocoa X; leaves a thin residual layer.
+    @discardableResult
+    func plowBlade(
+        surfaceID: UInt32,
+        globalX: Float,
+        bladeWidth: Float,
+        keepFraction: Float = 0.18,
+        minLayer: Float = 1.6
+    ) -> Float {
+        guard var surface = surfaces[surfaceID] else { return 0 }
+        let ledge = surface.ledge
+        let half = max(10, bladeWidth * 0.5)
+        let left = max(0, globalX - half - ledge.x)
+        let right = min(ledge.width, globalX + half - ledge.x)
+        guard right > left + 1 else { return 0 }
+        let scraped = surface.plowLeaveThinLayer(
+            fromLocalX: left,
+            toLocalX: right,
+            keepFraction: keepFraction,
+            minLayer: minLayer
+        )
+        surfaces[surfaceID] = surface
+        if scraped.taken > 0.04 {
+            markDriftDirty()
+            ejectScrapedSnow(
+                surface: surface,
+                localL: left,
+                localR: right,
+                amount: scraped.taken * 0.35,
+                peak: max(scraped.peak, 3),
+                winVX: -120,
+                winVY: 40
+            )
+        }
+        return scraped.taken
     }
 
     /// Menu / debug: drop a ready-made snowman on a ledge (or near the cursor).

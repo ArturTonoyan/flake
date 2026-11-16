@@ -146,7 +146,7 @@ final class WindowTracker {
 
             // Capture live Dock chrome. Ignore huge full-bleed Dock helpers.
             if owner == "Dock" || owner == "Dock Helper" {
-                if w >= 120, w <= 1400, h >= 36, h <= 120, layer >= 0 {
+                if w >= 120, w <= 2400, h >= 36, h <= 140, layer >= 0 {
                     measuredDocks.append((x: x, topY: topY, width: w, height: h))
                 }
                 continue
@@ -257,21 +257,21 @@ final class WindowTracker {
             let visibleTop = Float(visible.minY)
             let screenW = Float(frame.width)
 
-            // Live Dock chrome on this display. Pick the narrowest plausible pill —
-            // widest CGWindow is often an invisible full-bleed Dock helper.
+            // Live Dock chrome on this display. Prefer the widest floating pill
+            // (full glass bar), not the narrow icon-only layer. Skip near-full-bleed helpers.
             let candidates = measured.filter { dock in
                 let midX = dock.x + dock.width * 0.5
                 let onScreen = midX >= Float(frame.minX) - 4 && midX <= Float(frame.maxX) + 4
                 let nearBottom = abs(dock.topY - visibleTop) < 48
                     || abs((dock.topY - dock.height) - Float(frame.minY)) < 28
-                let floating = dock.width >= 140 && dock.width <= screenW * 0.82
+                let floating = dock.width >= 140 && dock.width <= screenW * 0.94
                 return onScreen && nearBottom && floating
             }
-            let live = candidates.min { a, b in
-                // Prefer icon-row height (~50–80) and narrower width.
+            let live = candidates.max { a, b in
+                // Wider glass pill wins; slight preference for typical Dock height.
                 let score: ((x: Float, topY: Float, width: Float, height: Float)) -> Float = { d in
-                    let hPenalty = abs(d.height - 62) * 2
-                    return d.width + hPenalty
+                    let hPenalty = abs(d.height - 70) * 0.35
+                    return d.width - hPenalty
                 }
                 return score(a) < score(b)
             }
@@ -281,14 +281,14 @@ final class WindowTracker {
             let dockTop: Float
             let dockHeight: Float
             if let live {
-                // Real floating pill width/x; Y from visibleFrame (stable across Spaces).
-                dockWidth = live.width + 6
-                dockX = live.x - 3
+                // Full floating pill (edge to edge of the glass), Y from visibleFrame.
+                dockWidth = live.width + 10
+                dockX = live.x - 5
                 dockTop = visibleTop
                 dockHeight = max(Float(bottomGap), min(live.height + 4, Float(bottomGap) + 20))
             } else {
-                // Fallback: typical floating Dock is far narrower than the display.
-                dockWidth = min(screenW * 0.7, max(220, screenW * 0.38))
+                // Fallback: wide floating Dock across most of the display.
+                dockWidth = min(screenW * 0.88, max(320, screenW * 0.62))
                 dockX = Float(visible.midX) - dockWidth * 0.5
                 dockTop = visibleTop
                 dockHeight = Float(bottomGap)

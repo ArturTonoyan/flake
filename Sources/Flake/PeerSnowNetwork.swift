@@ -63,6 +63,22 @@ struct InboundSnowman {
     let signText: String
 }
 
+struct OutboundSnowplow {
+    let edge: SnowEdge
+    let normY: Float
+    let vx: Float
+    let vy: Float
+}
+
+struct InboundSnowplow {
+    let fromPeerID: UInt64
+    let fromName: String
+    let entryEdge: SnowEdge
+    let normY: Float
+    let vx: Float
+    let vy: Float
+}
+
 /// LAN-only Bonjour + UDP snowball exchange.
 ///
 /// Discovery and packets stay on Wi‑Fi / Ethernet / AWDL (interface-scoped),
@@ -94,6 +110,7 @@ final class PeerSnowNetwork {
     private static let typeAck: UInt8 = 4
     private static let typeSnowman: UInt8 = 5
     private static let typeDuel: UInt8 = 6
+    private static let typeSnowplow: UInt8 = 7
     /// Duel payload packet: header + 6 floats + 2 score u16 + hmac.
     private static let duelPacketSize = 64
     private static let maxSnowballsPerSecond = 12
@@ -125,6 +142,7 @@ final class PeerSnowNetwork {
     var onPeersChanged: (([PeerInfo]) -> Void)?
     var onInboundSnowball: ((InboundSnowball) -> Void)?
     var onInboundSnowman: ((InboundSnowman) -> Void)?
+    var onInboundSnowplow: ((InboundSnowplow) -> Void)?
     /// Peer confirmed the snowball landed on their screen.
     var onThrowDelivered: ((String) -> Void)?
     /// No ACK within timeout — likely blocked / offline mid-flight.
@@ -319,6 +337,48 @@ final class PeerSnowNetwork {
                 vx: man.vx,
                 vy: man.vy,
                 signText: man.signText
+            )
+            if let seq {
+                self.pendingThrows[seq] = PendingThrow(
+                    peerID: peer.id,
+                    peerName: peer.name,
+                    sentAt: CACurrentMediaTime()
+                )
+            } else {
+                let name = peer.name
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?(name)
+                }
+            }
+        }
+    }
+
+    /// Throw the snowplow car that left the local desktop toward the peer on that edge.
+    func sendSnowplow(_ car: OutboundSnowplow) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.enabled else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("Wi‑Fi выкл")
+                }
+                return
+            }
+            let targets = self.targets(for: car.edge)
+            guard let peer = targets.first else {
+                let side = car.edge == .left ? "влево" : "вправо"
+                DispatchQueue.main.async { [weak self] in
+                    self?.onThrowMissed?("никого \(side)")
+                }
+                return
+            }
+            let seq = self.send(
+                type: Self.typeSnowplow,
+                to: peer,
+                edge: car.edge,
+                normY: car.normY,
+                vx: car.vx,
+                vy: car.vy,
+                mass: 1
             )
             if let seq {
                 self.pendingThrows[seq] = PendingThrow(
@@ -864,6 +924,39 @@ final class PeerSnowNetwork {
             )
             DispatchQueue.main.async { [weak self] in
                 self?.onInboundSnowman?(inbound)
+            }
+        case Self.typeSnowplow:
+            guard data.count == Self.packetSize else { return }
+            guard allowInbound(from: senderID) else { return }
+            let edgeRaw = bytes[24]
+            guard let leaveEdge = SnowEdge(rawValue: edgeRaw) else { return }
+            let normFixed = readUInt16(bytes, 26)
+            let normY = min(1, max(0, Float(normFixed) / 10_000))
+            var vx = readFloat(bytes, 28)
+            var vy = readFloat(bytes, 32)
+            vx = min(Self.maxAbsVelocity, max(-Self.maxAbsVelocity, vx))
+            vy = min(Self.maxAbsVelocity, max(-Self.maxAbsVelocity, vy))
+            let entry: SnowEdge = (leaveEdge == .left) ? .right : .left
+            let inbound = InboundSnowplow(
+                fromPeerID: senderID,
+                fromName: peer.name,
+                entryEdge: entry,
+                normY: normY,
+                vx: vx,
+                vy: vy
+            )
+            _ = send(
+                type: Self.typeAck,
+                to: peer,
+                edge: leaveEdge,
+                normY: 0,
+                vx: 0,
+                vy: 0,
+                mass: 0,
+                seqOverride: seq
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.onInboundSnowplow?(inbound)
             }
         case Self.typeGoodbye:
             peers[senderID]?.connection?.cancel()

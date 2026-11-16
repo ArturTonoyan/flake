@@ -38,6 +38,7 @@ final class OverlayController {
     private let toast = LanToastBanner()
     private let snowmanPoster = InboundSnowmanPoster()
     private let signPrompt = SnowmanSignPrompt()
+    private let snowplow = SnowplowController()
     /// Per-display overlay opacity during Space swipe (0…1). Dual monitors with
     /// separate Spaces must not fade the idle display when the other swipes.
     private var overlayFades: [CGDirectDisplayID: CGFloat] = [:]
@@ -58,6 +59,7 @@ final class OverlayController {
         get { peerNetwork.isEnabled }
         set {
             simulator.lanHandoffEnabled = newValue
+            snowplow.lanHandoffEnabled = newValue
             peerNetwork.setEnabled(newValue)
         }
     }
@@ -160,6 +162,15 @@ final class OverlayController {
             }
             self.toast.show("Снеговик от \(short)")
         }
+        peerNetwork.onInboundSnowplow = { [weak self] car in
+            guard let self else { return }
+            let short = Self.shortPeerName(car.fromName)
+            if self.snowplow.spawnInbound(car, simulator: self.simulator) {
+                self.toast.show("Снегоочиститель от \(short)")
+            } else {
+                self.toast.show("Машинка от \(short) не приземлилась")
+            }
+        }
         peerNetwork.onThrowDelivered = { [weak self] name in
             self?.toast.show("Долетело → \(Self.shortPeerName(name))")
         }
@@ -172,6 +183,7 @@ final class OverlayController {
         }
         let saved = UserDefaults.standard.bool(forKey: PeerSnowNetwork.defaultsKeyEnabled)
         simulator.lanHandoffEnabled = saved
+        snowplow.lanHandoffEnabled = saved
         peerNetwork.restoreFromDefaults()
     }
 
@@ -206,6 +218,15 @@ final class OverlayController {
             signText: ""
         )
         toast.show("Снеговик на окне")
+    }
+
+    /// Menu test: run the snowplow immediately (builds a pile if needed).
+    func triggerSnowplowTest() {
+        if snowplow.triggerTest(simulator: simulator) {
+            toast.show("Снегоочиститель")
+        } else {
+            toast.show("Нет полки для снегоочистителя")
+        }
     }
 
     /// Local preview of a signed snowman flying in (stays until click).
@@ -307,6 +328,7 @@ final class OverlayController {
     }
 
     func clearSnow() {
+        snowplow.dismiss()
         simulator.clear()
         snowmanPoster.dismissAll()
         for item in overlays {
@@ -483,7 +505,6 @@ final class OverlayController {
         simulator.mouseVY = Float(moveY) / max(dt, 0.001)
         // Source of truth — event monitors alone miss buttons across some apps.
         let pressed = (NSEvent.pressedMouseButtons & (1 << 0)) != 0
-        simulator.mouseDown = pressed
         simulator.mouseEnabled = mouseInteractionEnabled
 
         let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
@@ -495,6 +516,10 @@ final class OverlayController {
         if !isPaused {
             updateWorldBounds()
             // Force each tick — maximized blanking must not lag a cached window list.
+            // Snowplow grab first so holding the car doesn't also roll a snowball.
+            snowplow.lanHandoffEnabled = lanSnowballsEnabled
+            snowplow.update(dt: dt, simulator: simulator)
+            simulator.mouseDown = pressed && !snowplow.isHeld
             simulator.update(dt: dt, windows: tracker.windows(force: true, active: true))
             if lanSnowballsEnabled {
                 for exit in simulator.consumeEdgeExits() {
@@ -503,10 +528,18 @@ final class OverlayController {
                 for exit in simulator.consumeSnowmanExits() {
                     peerNetwork.sendSnowman(exit)
                 }
+                if let car = snowplow.consumeEdgeExit() {
+                    peerNetwork.sendSnowplow(car)
+                    toast.show("Снегоочиститель → …")
+                }
             }
         } else {
             // Peer hits still animate while local snow is paused.
             simulator.tickLanImpacts(dt: dt)
+            if snowplow.isRunning {
+                snowplow.update(dt: dt, simulator: simulator)
+            }
+            simulator.mouseDown = false
         }
 
         let signEntries = simulator.snowmenSignHUD()

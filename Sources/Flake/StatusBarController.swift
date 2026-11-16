@@ -84,6 +84,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         spawnSnowman.target = self
         menu.addItem(spawnSnowman)
 
+        let snowplow = NSMenuItem(
+            title: "Снегоочиститель (тест)",
+            action: #selector(triggerSnowplow),
+            keyEquivalent: "c"
+        )
+        snowplow.target = self
+        menu.addItem(snowplow)
+
         let duel = NSMenuItem(
             title: "Снежный бой",
             action: #selector(openDuelArena),
@@ -120,7 +128,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(tip)
 
         let lanTip = NSMenuItem(
-            title: "Кинь снежок/снеговика за край → другу",
+            title: "Кинь снежок/снеговика/машинку за край → другу",
             action: nil,
             keyEquivalent: ""
         )
@@ -306,6 +314,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func spawnTestSnowman() {
         overlay.spawnTestSnowman()
+    }
+
+    @objc private func triggerSnowplow() {
+        overlay.triggerSnowplowTest()
     }
 
     @objc private func openDuelArena() {
